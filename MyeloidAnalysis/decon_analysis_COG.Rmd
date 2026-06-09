@@ -1,0 +1,414 @@
+---
+title: "Deconvolution Analysis"
+output: html_notebook
+---
+
+```{r setup}
+library(Seurat)
+library(Signac)
+library(dplyr)
+library(RColorBrewer)
+library(ggplot2)
+library(pheatmap)
+library(tibble)
+library(grid)
+library(conflicted)
+library(tidyr)
+library(enrichplot)
+library(survival)
+library(ggfortify)
+library(cowplot)
+library(readxl)
+library(ggpubr)
+library(scales)
+library(stringr)
+conflict_prefer("select", "dplyr")
+conflict_prefer("filter", "dplyr")
+conflict_prefer("union", "base")
+conflict_prefer("setdiff", "base")
+`%notin%` = Negate(`%in%`)
+```
+
+Workflow:
+
+1. Get cell fractions of malignant cells 
+2. Add all metadata from Seurat objects in 
+3. Basic analysis 
+  - Association with risk, MRD value, etc. 
+  - Differences in cell type frequency by subtype, if present 
+4. Survival differences between low and high (top 25%)
+
+# Functions
+```{r}
+separate_malignant_ctype <- function(cbs.mtx){
+  mal.cbs.mtx <- cbs.mtx %>% dplyr::select(-starts_with("Healthy"))
+  
+  mal.cbs.mtx <- mal.cbs.mtx %>% group_by(Mixture) %>% 
+    dplyr::mutate(prop.sum = sum(c_across(starts_with("Blast"))))
+  
+  blast.cols <- colnames(mal.cbs.mtx)[grepl("Blast", colnames(mal.cbs.mtx))]
+  
+  for(i in blast.cols){
+    mal.cbs.mtx[,i] <- mal.cbs.mtx[,i]/mal.cbs.mtx[,"prop.sum"]
+  }
+  
+  return(mal.cbs.mtx)
+}
+```
+
+# Load Seurat object 
+## Edit metadata 
+```{r}
+cog.s <- readRDS("BALL_StJudesCohort_SeuratObject_RLogValues_111125.rds")
+
+cols.to.modify <- c("Treatment.Arm", "WBC.count.at.baseline","Time.to.Relapse.early.intermediate.late.", "CNS.status.at.baseline", "Bone.Marrow.status.at.baseline", "First.event.type", "Day.8.Percent.MRD", "Day.29.MRD.category")
+
+cog.s@meta.data <- cog.s@meta.data %>%
+  dplyr::mutate(across(all_of(cols.to.modify), ~str_split_fixed(., ":", 2)[, 2]))
+cog.s@meta.data <- cog.s@meta.data %>%
+  dplyr::mutate(EFS.indicator = if_else(If.had.a.relapse=="0:No", 0, 1))
+
+cog.s$Day.29.Percent.MRD <- as.numeric(cog.s$Day.29.Percent.MRD)
+cog.s$OS.years.from.Dx <- as.numeric(cog.s$OS.years.from.Dx)
+cog.s$Age.at.Relapse <- as.numeric(cog.s$Age.at.Relapse)
+cog.s$EFS.years.from.Dx <- as.numeric(cog.s$EFS.years.from.Dx)
+
+cog.s$time.EFS <- cog.s$EFS.years.from.Dx * 365
+cog.s$time.OS <- cog.s$OS.years.from.Dx * 365
+cog.s$status.OS <- as.numeric(cog.s$OS.indictor.from.Dx)
+
+cog.s@meta.data <- dplyr::mutate(cog.s@meta.data, Day.29.MRD.category = 
+                  case_when(Day.29.Percent.MRD < 0.01 ~ "<0.01%",
+                            Day.29.Percent.MRD >=0.01 & Day.29.Percent.MRD <0.1 ~ "0.01-0.1%",
+                            Day.29.Percent.MRD >=0.1 & Day.29.Percent.MRD <1 ~ "0.1-1%",
+                            Day.29.Percent.MRD >=1 & Day.29.Percent.MRD <5 ~ "1-5%",
+                            Day.29.Percent.MRD > 5 ~ ">5%",
+                            ))
+
+cog.s@meta.data <- dplyr::mutate(cog.s@meta.data, Day.29.MRD.Positivity = 
+                  case_when(Day.29.Percent.MRD < 0.01 ~ "Negative",
+                            Day.29.Percent.MRD >=0.01 ~ "Positive",
+                            ))
+```
+
+# Ctype data load 
+```{r}
+cog.d <- read.delim("StJudes_COG_Fraction0.25_SplitEL_MylComb_ComBatRef_CIBERSORTx_Adjusted.txt")
+cog.d.mal <- separate_malignant_ctype(cog.d)
+
+cog.s@meta.data <- left_join(cog.s@meta.data, cog.d.mal, by=c("COG_USI"="Mixture"))
+```
+
+# Overall Deconvolution Plots 
+```{r}
+# Not batch corrected matrix 
+cog.d.list <- cog.d.mal %>% 
+  pivot_longer(cols=(starts_with("Blast")), names_to = "Ctype", values_to = "Fraction")
+
+cog.d.list <- left_join(cog.d.list, cog.s@meta.data, by=c("Mixture"="COG_USI"))
+
+cog.d.list$Ctype <- factor(cog.d.list$Ctype, 
+                           levels=c("Blast_HSPC","Blast_CLP","Blast_Pre.pro.B","Blast_Pro.B",
+                                    "Blast_Pre.B","Blast_Immature.Mature.B","Blast_Myeloid"))
+
+pdf("ProjCtypeDecon_CellFractionFrequency.pdf", width=5, height=5)
+ggboxplot(cog.d.list, x="Ctype", y="Fraction",outlier.shape = NA, fill = "Ctype",ncol=1) +
+  rotate_x_text(angle=45) +
+  geom_jitter(size=0.05)
+dev.off()
+
+```
+
+```{r}
+ctype.fractions <- colnames(cog.d.mal)[grepl("Blast*", colnames(cog.d.mal))]
+
+plot.list <- list()
+p.km.list <- c()
+p.ch.list <- c()
+
+pdf("COG_SurvivalPlots_MalignantCtypeFractions_010126.pdf", height=5, width=10)
+
+for(j in 1:length(ctype.fractions)){
+  
+  score.name <- ctype.fractions[j]
+  
+  if(score.name %in% c("Blast_CLP", "Blast_HSPC", "Blast_Pre.pro.B") ){
+    next
+  }
+  
+  survival.data = cog.s@meta.data
+  
+  survival.data$mpp.rank =  survival.data[[score.name]] %>% rank()
+  
+  #hist(survival.data$Blast_HSPC)
+  
+  survival.data = survival.data %>% 
+    dplyr::mutate(high.mpp = case_when(mpp.rank > (nrow(survival.data)*0.75) ~ "Sig High",
+                                       mpp.rank < (nrow(survival.data)*0.25) ~ "Sig Low"))
+  
+  survival.data <- survival.data %>% dplyr::filter(!is.na(high.mpp))
+  
+  
+  table(survival.data$high.mpp)
+  os_km_fit <- survfit(Surv(time.EFS, EFS.indicator) ~ high.mpp , data=survival.data)
+  #cox.test = coxph(Surv(time.EFS, EFS.indicator) ~ high.mpp + EOI.MRD, data=survival.data)
+  cox.test = coxph(Surv(time.EFS, EFS.indicator) ~ high.mpp, data=survival.data)
+  cox.coefs.gene.and.mrd = summary(cox.test)
+  
+  if(nrow(survival.data) >100 ){
+    p.val = cox.coefs.gene.and.mrd$logtest[3] %>% print()
+  }else{
+    p.val = cox.coefs.gene.and.mrd$sctest[3] %>% print()
+    
+  }
+  
+  # if("CNS" %in% colnames(survival.data)){
+  cox.test2 = coxph(Surv(time.EFS, EFS.indicator) ~ survival.data[[score.name]] +  CNS.status.at.baseline + WBC.count.at.baseline,
+                    data=survival.data)
+  # cox.test2 = coxph(Surv(time.EFS, EFS.indicator) ~ mpp.rank + cns.status,
+  #                    data=survival.data)
+  cox.test.summary = summary(cox.test2)
+  p.val.signature = cox.test.summary$coefficients[1,5] %>% print()
+  
+  # }else{
+  #   cox.test2 = coxph(Surv(time.EFS, EFS.indicator) ~ survival.data[[score.name]], data=survival.data)
+  #   # cox.test2 = coxph(Surv(time.EFS, EFS.indicator) ~ mpp.rank + EOI.MRD, data=survival.data)
+  #   cox.test.summary = summary(cox.test2)
+  #   p.val.signature = cox.test.summary$coefficients[1,5] %>% print()
+  #   
+  # }
+  
+  p.km.list <- append(p.km.list, p.val)
+  p.ch.list <- append(p.ch.list, p.val.signature)
+  
+  p.os = autoplot(os_km_fit)+ ylim(c(0, 1.0)) + 
+    labs(x = "EFS (Days) ", y = "Survival Probability", 
+         title = "") + 
+    theme_classic()+
+    theme(plot.title = element_text(hjust = 0.5), 
+          # axis.title.x = element_text( colour="black", size = 25),
+          # axis.title.y = element_text( colour="black", size = 25),
+          # axis.text = element_text(size = 20),
+          legend.title = element_text(face="bold"))+
+    scale_fill_manual(values = c("#BE433D","#459DA5"))+
+    scale_color_manual(values =  c("#BE433D","#459DA5"))
+  
+  p.os + scale_fill_manual(values = c("white", "white"))
+  
+  
+  survival.data.boxplot = survival.data %>% filter(EFS.indicator %in% c("Alive", "Dead", 1, 0))
+  survival.data.boxplot = survival.data.boxplot %>% 
+    dplyr::mutate(EFS.indicator.plot = case_when(EFS.indicator == 0 ~ "No Event",
+                                              EFS.indicator == 1 ~ "Event"))
+  
+  p.save = p.os + scale_fill_manual(values = c("white", "white")) + 
+    geom_step(aes(color = group), alpha = 0.8) + 
+    geom_point( shape = "+") +
+    scale_color_manual(values =  c("#BE433D","#459DA5")) +
+    annotate(geom = "text", label = paste0("p =", round(p.val, 5)), x=1000, y=0.4) +
+    annotate(geom = "text", label = paste0("p.sig =", round(p.val.signature, 5)),x=1000, y=0.50) +
+    ggtitle(label = paste(score.name), subtitle = paste("n=", nrow(survival.data.boxplot)))
+  
+  p.save.2 = ggplot(survival.data.boxplot, aes(x = EFS.indicator.plot, y = survival.data.boxplot[[score.name]])) + 
+    geom_point(position = "jitter") +
+    geom_violin(draw_quantiles = c(0.5), alpha = 0.5) + 
+    stat_compare_means() +
+    theme_bw() +
+    ggtitle(score.name, subtitle = paste( "n=", nrow(survival.data.boxplot))) +
+    labs(y = score.name)
+  
+    print(cowplot::plot_grid(plotlist = list(p.save, p.save.2)))
+  
+}
+
+# dev.off()
+
+```
+
+# Survival differences by subtype 
+```{r}
+ctype.fractions <- colnames(cog.d.mal)[grepl("Blast*", colnames(cog.d.mal))]
+
+plot.list <- list()
+p.km.list <- c()
+p.ch.list <- c()
+
+subtype.list <- unique(cog.s$Primary.sample.subtype)
+
+pdf("COG_SurvivalPlots_Subtype_MalignantCtypeFractions_010726.pdf", height=5, width=10)
+
+for(i in 1:length(subtype.list)){
+  
+  score.name <- "Blast_Myeloid"
+  
+  current.subtype <- subtype.list[i]
+  
+  # if(current.subtype %in% c("NUTM1", "Low hypodiploid") ){
+  #   next
+  # }
+  
+  survival.data = cog.s@meta.data %>% dplyr::filter(Primary.sample.subtype==current.subtype)
+  
+  survival.data$mpp.rank =  survival.data[[score.name]] %>% rank()
+  
+  #hist(survival.data$Blast_HSPC)
+  
+  survival.data = survival.data %>% 
+    dplyr::mutate(high.mpp = case_when(mpp.rank > (nrow(survival.data)*0.5) ~ "Sig High",
+                                       mpp.rank < (nrow(survival.data)*0.5) ~ "Sig Low"))
+  
+  survival.data <- survival.data %>% dplyr::filter(!is.na(high.mpp))
+  
+  table(survival.data$high.mpp)
+  os_km_fit <- survfit(Surv(time.EFS, EFS.indicator) ~ high.mpp , data=survival.data)
+  #cox.test = coxph(Surv(time.EFS, EFS.indicator) ~ high.mpp + EOI.MRD, data=survival.data)
+  
+  res <- try({
+    # code that might error
+    cox.test = coxph(Surv(time.EFS, EFS.indicator) ~ high.mpp, data=survival.data)
+  }, silent = TRUE)
+  
+  if (inherits(res, "try-error")) {
+    # skip this iteration
+    next
+  }
+  
+  cox.coefs.gene.and.mrd = summary(cox.test)
+  
+  if(nrow(survival.data) >100 ){
+    p.val = cox.coefs.gene.and.mrd$logtest[3] %>% print()
+  }else{
+    p.val = cox.coefs.gene.and.mrd$sctest[3] %>% print()
+    
+  }
+  
+  res <- try({
+    # code that might error
+    cox.test2 = coxph(Surv(time.EFS, EFS.indicator) ~ survival.data[[score.name]] +  CNS.status.at.baseline + WBC.count.at.baseline,
+                    data=survival.data)
+  }, silent = TRUE)
+
+  if (inherits(res, "try-error")) {
+    # skip this iteration
+    next
+  }
+  
+  
+  # if("CNS" %in% colnames(survival.data)){
+  
+  # cox.test2 = coxph(Surv(time.EFS, EFS.indicator) ~ mpp.rank + cns.status,
+  #                    data=survival.data)
+  cox.test.summary = summary(cox.test2)
+  p.val.signature = cox.test.summary$coefficients[1,5] %>% print()
+  
+  # }else{
+  #   cox.test2 = coxph(Surv(time.EFS, EFS.indicator) ~ survival.data[[score.name]], data=survival.data)
+  #   # cox.test2 = coxph(Surv(time.EFS, EFS.indicator) ~ mpp.rank + EOI.MRD, data=survival.data)
+  #   cox.test.summary = summary(cox.test2)
+  #   p.val.signature = cox.test.summary$coefficients[1,5] %>% print()
+  #   
+  # }
+  
+  p.km.list <- append(p.km.list, p.val)
+  p.ch.list <- append(p.ch.list, p.val.signature)
+  
+  p.os = autoplot(os_km_fit)+ ylim(c(0, 1.0)) + 
+    labs(x = "EFS (Days) ", y = "Survival Probability", 
+         title = "") + 
+    theme_classic()+
+    theme(plot.title = element_text(hjust = 0.5), 
+          # axis.title.x = element_text( colour="black", size = 25),
+          # axis.title.y = element_text( colour="black", size = 25),
+          # axis.text = element_text(size = 20),
+          legend.title = element_text(face="bold"))+
+    scale_fill_manual(values = c("#BE433D","#459DA5"))+
+    scale_color_manual(values =  c("#BE433D","#459DA5"))
+  
+  p.os + scale_fill_manual(values = c("white", "white"))
+  
+  
+  survival.data.boxplot = survival.data %>% filter(EFS.indicator %in% c("Alive", "Dead", 1, 0))
+  survival.data.boxplot = survival.data.boxplot %>% 
+    dplyr::mutate(EFS.indicator.plot = case_when(EFS.indicator == 0 ~ "No Event",
+                                              EFS.indicator == 1 ~ "Event"))
+  
+  p.save = p.os + scale_fill_manual(values = c("white", "white")) + 
+    geom_step(aes(color = group), alpha = 0.8) + 
+    geom_point( shape = "+") +
+    scale_color_manual(values =  c("#BE433D","#459DA5")) +
+    annotate(geom = "text", label = paste0("p =", round(p.val, 5)), x=1000, y=0.4) +
+    annotate(geom = "text", label = paste0("p.sig =", round(p.val.signature, 5)),x=1000, y=0.50) +
+    ggtitle(label = paste(current.subtype), subtitle = paste("n=", nrow(survival.data.boxplot)))
+  
+  p.save.2 = ggplot(survival.data.boxplot, aes(x = EFS.indicator.plot, y = survival.data.boxplot[[score.name]])) + 
+    geom_point(position = "jitter") +
+    geom_violin(draw_quantiles = c(0.5), alpha = 0.5) + 
+    stat_compare_means() +
+    theme_bw() +
+    ggtitle(score.name, subtitle = paste( "n=", nrow(survival.data.boxplot))) +
+    labs(y = score.name)
+  
+    print(cowplot::plot_grid(plotlist = list(p.save, p.save.2)))
+  
+}
+
+dev.off()
+```
+
+```{r}
+
+pdf("/mnt/isilon/tan_lab/mehtar1/MRD_RM/Survival_Analysis/Plots/StJudes_COG/COG_CellTypeAssociationsWithMetadata_090425.pdf", height=6, width=10)
+
+p1 <- cog.s@meta.data %>%
+  group_by(Primary.sample.subtype) %>%
+  mutate(median_myl = mean(Blast_Myeloid)) %>%
+  ggplot(aes(x=reorder(Primary.sample.subtype, -median_myl), y=Blast_Myeloid, fill=Primary.sample.subtype)) +
+  geom_boxplot(outlier.size=0, outlier.shape = NA) +
+  geom_jitter(size=0.5) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1),
+        legend.position = "none")
+  
+
+p3 <- cog.s@meta.data %>% 
+  ggplot(aes(x=reorder(Primary.sample.subtype, -Blast_HSPC), y=Blast_HSPC, fill=Primary.sample.subtype)) + 
+  geom_boxplot(outlier.size=1, outlier.shape = NA) + 
+  geom_jitter(size=0.5) + 
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1),
+        legend.position = "none")
+  
+
+ggarrange(plotlist = list(p1,p3), ncol=1)
+
+p1 <- cog.s@meta.data %>% 
+  ggboxplot(x="Day.29.MRD.Positivity", y="Blast_Myeloid", add="jitter") + 
+  stat_compare_means(method="wilcox", comparisons = list(c("Negative", "Positive")))
+
+p3 <- cog.s@meta.data %>% 
+  ggboxplot(x="Day.29.MRD.Positivity", y="Blast_HSPC", add="jitter") + 
+  stat_compare_means(method="wilcox", comparisons = list(c("Negative", "Positive")))
+
+ggarrange(plotlist=list(p1,p3), ncol=3)
+
+cog.s$Time.to.Relapse.early.intermediate.late. <- 
+  factor(cog.s$Time.to.Relapse.early.intermediate.late., levels=c("<18 months", "18-35 months", ">=36 months"))
+
+p1 <- cog.s@meta.data %>% 
+  ggboxplot(x="Time.to.Relapse.early.intermediate.late.", y="Blast_Myeloid", add="jitter") + 
+  stat_compare_means(method="wilcox", comparisons = list(c("<18 months", "18-35 months"), 
+                                                         c("18-35 months", ">=36 months"),
+                                                         c("<18 months", ">=36 months")))
+
+p3 <- cog.s@meta.data %>% 
+  ggboxplot(x="Time.to.Relapse.early.intermediate.late.", y="Blast_HSPC", add="jitter") + 
+  stat_compare_means(method="wilcox", comparisons = list(c("<18 months", "18-35 months"), 
+                                                         c("18-35 months", ">=36 months"),
+                                                         c("<18 months", ">=36 months")))
+
+ggarrange(plotlist=list(p1,p3), ncol=2)
+
+dev.off()
+
+```
+

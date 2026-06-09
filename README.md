@@ -1,4 +1,2 @@
-# MRD
-HTAN MRD Project
-
-Started August 2022. 
+# HTAN MRD
+Therapy-induced lineage plasticity in B-ALL MRD

@@ -1,0 +1,254 @@
+---
+title: "DTF Consensus Clustering Visualisation"
+output: html_notebook
+---
+
+# Overview
+
+This notebook visualises the results of differential transcription factor (DTF)
+consensus clustering. It continues from `02_DTF_ConsensusClustering.R`, which
+produced the mean chromVAR z-score deviation matrix (DTFs × dASPs).
+
+Consensus clustering (ConsensusClusterPlus, k-means, k = 1–25) is applied to
+the DTF matrix to identify reproducible TF sets. The optimal k is selected by
+inspecting the consensus CDF and delta-area plots output by the run. Results
+are visualised as:
+
+  - A heatmap of all DTFs ordered by consensus cluster, coloured by dASP
+  - A condensed heatmap showing the average expression per consensus cluster
+  - Per-cluster individual TF heatmaps (one per consensus cluster)
+
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+library(gam)
+library(Seurat)
+library(Signac)
+library(dplyr)
+library(RColorBrewer)
+library(BiocParallel)
+library(ggplot2)
+library(pheatmap)
+library(enrichR)
+library(tibble)
+library(grid)
+library(conflicted)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(ReactomePA)
+library(MAST)
+library(ComplexUpset)
+library(tidyr)
+library(simplifyEnrichment)
+library(rstatix)
+library(EnhancedVolcano)
+library(ggpubr)
+library(ConsensusClusterPlus)
+
+conflicted::conflict_prefer("select", "dplyr")
+conflicted::conflict_prefer("filter", "dplyr")
+conflicted::conflict_prefer("union",  "base")
+conflicted::conflict_prefer("setdiff","base")
+conflicted::conflict_prefer("upset",  "ComplexUpset")
+
+`%notin%` <- Negate(`%in%`)
+```
+
+---
+
+# USER CONFIGURATION
+
+```{r config}
+# Input: consensus matrix from 02_DTF_ConsensusClustering.R
+path.cc.matrix <- "/path/to/Tables/Chromvar_CISBP_ClusterPseudobulk/ConsensusDTFlist.ClusterPB.k4.rds"
+
+# Input: all DTF calls (for optional volcano plots)
+path.dtf.list  <- "/path/to/Tables/Chromvar_CISBP_ClusterPseudobulk/DTFList.allClustersPB.k4.PTregressed.rds"
+
+# Directory where ConsensusClusterPlus writes its PNG output files
+dir.cc.output  <- "/path/to/Tables/Chromvar_CISBP_ClusterPseudobulk/"
+
+# Output PDF
+path.output.pdf <- "/path/to/Plots/PB_DTF_CC_byTrajCluster.pdf"
+
+# Consensus clustering parameters
+CC_MAX_K    <- 25      # max k to test
+CC_REPS     <- 10      # number of subsampling replicates
+CC_P_ITEM   <- 0.8     # fraction of items (TFs) to subsample per replicate
+CC_SEED     <- 1262118388.71279
+
+# Selected k (set after inspecting the CDF / delta-area plots from CC run)
+# Update this after examining the ConsensusClusterPlus output PNGs
+SELECTED_K  <- 10
+
+# dASP column labels for heatmap (update if dASP identities have been renamed)
+DASP_LABELS <- c("Bi-directional", "HSPC/Myeloid",
+                  "Immature/Mature-B", "Mature-B")
+
+# Heatmap colour limits
+HEATMAP_LIMITS <- c(-1, 1)
+```
+
+---
+
+## Load data
+
+```{r load-data}
+cc.matrix <- readRDS(path.cc.matrix)
+dtfs      <- readRDS(path.dtf.list)
+
+cat("DTF matrix dimensions:", nrow(cc.matrix), "TFs ×",
+    ncol(cc.matrix), "dASPs\n")
+```
+
+---
+
+## Run ConsensusClusterPlus
+
+```{r consensus-clustering}
+# ConsensusClusterPlus requires features as rows, samples as columns.
+# Our matrix has DTFs as rows and dASPs as columns, so transpose before running.
+current.matrix <- t(cc.matrix)
+
+setwd(dir.cc.output)
+
+cc_run <- ConsensusClusterPlus(
+  current.matrix,
+  reps        = CC_REPS,
+  pItem       = CC_P_ITEM,
+  pFeature    = 1,
+  clusterAlg  = "km",
+  seed        = CC_SEED,
+  plot        = "png",
+  writeTable  = TRUE,
+  maxK        = CC_MAX_K,
+  distance    = "euclidean",
+  title       = "Pseudobulk_CC"
+)
+
+cat("Consensus clustering complete. PNG output in:", dir.cc.output, "\n")
+cat("Inspect delta-area plots to confirm SELECTED_K =", SELECTED_K, "\n")
+```
+
+---
+
+## Load consensus cluster assignments and build ordered heatmaps
+
+```{r load-cc-assignments}
+# Load the consensus class assignments for the selected k
+cc.csv.path <- file.path(dir.cc.output, "Pseudobulk_CC",
+                           paste0("Pseudobulk_CC.k=", SELECTED_K,
+                                  ".consensusClass.csv"))
+
+tf.order <- read.csv(cc.csv.path, col.names = c("TF", "CC")) %>%
+  arrange(CC)
+
+# Align LFC matrix to the TF order from CC
+lfc.matrix <- cc.matrix %>%
+  as.data.frame() %>%
+  mutate(rn = rownames(.))
+
+tf.indices <- match(tf.order$TF, rownames(lfc.matrix))
+lfc.matrix <- lfc.matrix[tf.indices, 1:4]  # keep dASP columns only
+```
+
+---
+
+## Compute per-consensus-cluster average expression
+
+```{r avg-expression}
+avg.exp <- cc.matrix %>%
+  as.data.frame() %>%
+  mutate(rn = rownames(.)) %>%
+  left_join(tf.order, by = c("rn" = "TF")) %>%
+  group_by(CC) %>%
+  mutate(tf_count = n()) %>%
+  summarise(across(where(is.numeric), mean), .groups = "drop") %>%
+  # Rank consensus clusters by mean expression across dASPs (descending)
+  mutate(avg_val  = rowMeans(across(as.character(1:4))),
+         avg_rank = rank(-avg_val)) %>%
+  arrange(avg_rank)
+
+tf.order <- tf.order %>%
+  left_join(avg.exp %>% dplyr::select(CC, avg_rank), by = "CC") %>%
+  arrange(avg_rank)
+
+# Row labels for average heatmap: "Consensus Cluster X: N TFs"
+row_labels <- paste0("TF Set ", avg.exp$CC, ": ",
+                      avg.exp$tf_count, " TFs")
+
+cat("Consensus clusters (ranked by avg expression):\n")
+print(avg.exp %>% dplyr::select(CC, tf_count, avg_rank))
+```
+
+---
+
+## Heatmap: all DTFs ordered by consensus cluster
+
+```{r full-heatmap, fig.width=4, fig.height=8}
+pdf(path.output.pdf, height = 6, width = 4)
+
+# Full DTF heatmap ordered by CC
+pheatmap(lfc.matrix[match(tf.order$TF, rownames(lfc.matrix)), ],
+         main             = "DTF Consensus Clustering",
+         color            = colorRampPalette(rev(brewer.pal(9, "RdBu")))(100),
+         breaks           = seq(HEATMAP_LIMITS[1], HEATMAP_LIMITS[2], length = 100),
+         cluster_rows     = FALSE,
+         cluster_cols     = FALSE,
+         gaps_row         = which(!!diff(tf.order$CC)),
+         show_colnames    = TRUE,
+         show_rownames    = FALSE,
+         labels_col       = DASP_LABELS,
+         fontsize         = 8)
+
+# Average expression heatmap (one row per consensus cluster)
+avg.exp.plot <- avg.exp %>%
+  dplyr::select(as.character(1:4)) %>%
+  as.data.frame()
+rownames(avg.exp.plot) <- row_labels
+
+pheatmap(avg.exp.plot,
+         main          = "Average DTF Expression by TF Set",
+         color         = colorRampPalette(rev(brewer.pal(9, "RdBu")))(100),
+         breaks        = seq(HEATMAP_LIMITS[1], HEATMAP_LIMITS[2], length = 100),
+         cluster_rows  = FALSE,
+         cluster_cols  = FALSE,
+         show_colnames = TRUE,
+         show_rownames = TRUE,
+         labels_col    = DASP_LABELS,
+         fontsize      = 8)
+```
+
+---
+
+## Per-TF-set individual heatmaps
+
+```{r per-set-heatmaps, fig.width=4, fig.height=6}
+n_sets <- length(unique(tf.order$CC))
+
+for (j in seq_len(n_sets)) {
+  set.tfs <- tf.order$TF[tf.order$avg_rank == j]
+
+  pheatmap(lfc.matrix[set.tfs, , drop = FALSE],
+           main             = paste0("TF Set ", j),
+           color            = colorRampPalette(rev(brewer.pal(9, "RdBu")))(100),
+           breaks           = seq(HEATMAP_LIMITS[1], HEATMAP_LIMITS[2], length = 100),
+           cluster_rows     = FALSE,
+           cluster_cols     = FALSE,
+           show_colnames    = TRUE,
+           show_rownames    = TRUE,
+           labels_col       = DASP_LABELS,
+           cellwidth        = 40,
+           cellheight       = 8,
+           fontsize         = 8)
+}
+
+dev.off()
+cat("Heatmaps saved to:", path.output.pdf, "\n")
+```
+
+---
+
+```{r session-info}
+sessionInfo()
+```

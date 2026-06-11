@@ -1,0 +1,949 @@
+---
+title: "VHR-ALL: SNPs link pooled MRD cells to IDX samples"
+author: "Steven M. Foltz"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: TRUE
+    toc_float: TRUE
+    df_print: paged
+---
+
+# Summary
+
+### Objective
+
+- Explore targeted scDNA data quality and availability for VHR-ALL patient samples
+- Determine appropriate decision-making cutoffs and conditions for consensus
+  genotypes and informative SNPs
+- Define a distance metric between two sets of genotypes
+- For pooled MRD samples, measure distance between each barcode and paired
+  IDX samples
+
+### Results
+
+- scDNA data requires pre-processing steps to harmonise alternate alleles
+  between paired samples (`bcftools` useful for sorting, indexing, selecting
+  SNPs or targeted positions)
+- ~3% of loaded cells are barcoded/sequenced
+- Generally 2,000–5,000 barcoded cells per sample
+- Different genotype quality cutoffs are appropriate in different contexts:
+  - GQ = 99 for consensus genotype calls (require 95% of cells to agree)
+  - GQ ≥ 20 adequate for cell-to-sample matching (allow 1 missing allele pair)
+- Normalised Hamming distance captures proportion of shared genotypes while
+  handling missing data
+- 70–90% of pooled MRD barcodes can be uniquely assigned to one IDX sample
+
+---
+
+# Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(reshape2)
+library(ggrepel)
+library(ggtern)  # used for Pool 2 three-way Hamming distance plot
+
+phi <- 1.61803  # golden ratio used for figure aspect ratios
+```
+
+### Declare input and output filepaths
+
+```{r filepaths}
+# Output directories (created if absent)
+plots_dir     <- here::here("plots")
+plots_pdf_dir <- file.path(plots_dir, "pdf")
+plots_png_dir <- file.path(plots_dir, "png")
+
+dir.create(plots_dir,     showWarnings = FALSE)
+dir.create(plots_pdf_dir, showWarnings = FALSE)
+dir.create(plots_png_dir, showWarnings = FALSE)
+
+SNP_GT_dir   <- here::here("SNP_GT")
+metadata_dir <- here::here("metadata_processed")
+
+# Inputs
+patient_info_filepath <- file.path(metadata_dir, "patient_info.tsv")
+filenames_filepath    <- file.path(metadata_dir, "filenames.tsv")
+
+# Output
+pooled_barcode_assignments_filepath <- file.path("pooled_barcode_assignments.tsv")
+```
+
+---
+
+# Helper functions
+
+```{r functions}
+# get_consensus_genotype -------------------------------------------------------
+# For a single-variant SNP data frame (one row per cell), returns:
+#   - the consensus allele string (default)
+#   - the consensus genotype string (return_genotype = TRUE)
+#   - the proportion of cells with the most common genotype (return_prop = TRUE)
+# A consensus is called only if >= cell_prop of cells passing the GQ threshold
+# share the same genotype.
+get_consensus_genotype <- function(snp_df,
+                                   gq_min        = 99,
+                                   cell_prop     = 0.95,
+                                   return_genotype = FALSE,
+                                   return_prop     = FALSE) {
+  if (!is.numeric(gq_min) || gq_min < 0 || gq_min > 99)
+    stop("gq_min must be a number in [0, 99]")
+  if (!is.numeric(cell_prop) || cell_prop <= 0.5 || cell_prop > 1)
+    stop("cell_prop must be a number in (0.5, 1]")
+
+  pass_df <- snp_df |> dplyr::filter(quality >= gq_min)
+  n_pass  <- nrow(pass_df)
+
+  if (n_pass == 0) return(NA)
+
+  pass_df <- pass_df |>
+    dplyr::count(genotype, alleles) |>
+    dplyr::mutate(prop = n / n_pass)
+
+  if (return_prop) return(max(pass_df$prop))
+
+  if (max(pass_df$prop) >= cell_prop) {
+    max_allele <- pass_df$alleles[which.max(pass_df$prop)]
+    max_gt     <- pass_df$genotype[which.max(pass_df$prop)]
+    if (return_genotype) return(max_gt) else return(max_allele)
+  }
+
+  NA
+}
+
+# get_cell_genotypes / get_cell_alleles ----------------------------------------
+# For a per-cell SNP data frame, returns a named list (one entry per variant)
+# of genotype or allele strings. Calls below the GQ threshold are set to NA.
+get_cell_genotypes <- function(cell_df, gq_min = 20) {
+  cell_df |>
+    dplyr::mutate(genotype = ifelse(quality >= gq_min, genotype, NA)) |>
+    (\(x) split(x, f = x$variant))() |>
+    purrr::map(\(x) x$genotype)
+}
+
+get_cell_alleles <- function(cell_df, gq_min = 20) {
+  cell_df |>
+    dplyr::mutate(alleles = ifelse(quality >= gq_min, alleles, NA)) |>
+    (\(x) split(x, f = x$variant))() |>
+    purrr::map(\(x) x$alleles)
+}
+
+# get_informative_variants -----------------------------------------------------
+# Returns the subset of variants that are non-missing in all specified samples.
+# Set keep_same_alleles = FALSE to retain only variants that differ across
+# samples (used for demultiplexing pooled samples).
+get_informative_variants <- function(alleles_list,
+                                     sample_ids,
+                                     stages,
+                                     keep_same_alleles = TRUE) {
+  purrr::map2(sample_ids, stages,
+              \(x, y) purrr::map(alleles_list[[x]][[y]],
+                                  \(z) ifelse(is.na(z), "Missing", z))) |>
+    reshape2::melt() |>
+    dplyr::group_by(L2) |>
+    dplyr::summarize(none_missing  = all(value != "Missing"),
+                     keep_allele   = ifelse(keep_same_alleles, TRUE,
+                                             length(unique(value)) > 1),
+                     .groups = "drop") |>
+    dplyr::filter(none_missing, keep_allele) |>
+    dplyr::pull(L2)
+}
+
+# norm_hamm_dist ---------------------------------------------------------------
+# Normalised Hamming distance between two allele vectors x and y over a set of
+# variants. Returns the proportion of compared positions that differ.
+# Returns NA if fewer than min_var positions are non-missing, or if more than
+# n_na positions are missing (when n_na is specified).
+# possible_alleles: named list of valid alleles per variant; positions where
+# either cell carries an unexpected allele are set to NA before comparison.
+norm_hamm_dist <- function(x, y, variants_vec,
+                            min_var         = 3,
+                            n_na            = NULL,
+                            possible_alleles = NULL) {
+  if (!all(names(x) == names(y)))
+    stop("Names of the two allele lists must be identical.")
+
+  if (!is.null(possible_alleles)) {
+    make_var_na <- purrr::map_lgl(
+      variants_vec,
+      \(v) !(x[[v]] %in% possible_alleles[[v]]) |
+            !(y[[v]] %in% possible_alleles[[v]])
+    )
+    x[make_var_na] <- NA
+    y[make_var_na] <- NA
+  }
+
+  z <- purrr::map2_lgl(x, y, \(a, b) a == b)[variants_vec]
+
+  if (sum(!is.na(z)) < min_var) return(NA)
+
+  enough_coverage <- is.null(n_na) || sum(is.na(z)) <= n_na
+  if (enough_coverage) 1 - sum(z, na.rm = TRUE) / sum(!is.na(z)) else NA
+}
+```
+
+---
+
+# Read in data
+
+```{r read-data, message=FALSE}
+patient_info_df <- readr::read_tsv(patient_info_filepath, show_col_types = FALSE)
+filenames_df    <- readr::read_tsv(filenames_filepath,    show_col_types = FALSE)
+
+SNP_GT_filename_df <- filenames_df |>
+  dplyr::select(patient, USI, stage, pool, filename = SNP_GT_filename)
+
+# Load all SNP genotype files, adding sample metadata columns
+SNP_df <- purrr::pmap(
+  SNP_GT_filename_df,
+  \(patient, USI, stage, pool, filename)
+    readr::read_tsv(filename, show_col_types = FALSE) |>
+    tibble::add_column(patient = patient, USI = USI,
+                       stage = stage, pool = pool, .before = 0) |>
+    dplyr::mutate(variant = stringr::str_c(chr, pos, sep = ":"))
+) |>
+  dplyr::bind_rows()
+
+vcf_n_cells_df <- SNP_df |>
+  dplyr::group_by(patient, USI, stage, pool) |>
+  dplyr::summarize(n_cells = length(unique(cell_barcode)), .groups = "drop")
+
+# Separate pooled and non-pooled samples
+nonpooled_SNP_df <- SNP_df |> dplyr::filter(is.na(pool))
+
+pooled_SNP_df <- SNP_df |>
+  dplyr::filter(!is.na(pool)) |>
+  dplyr::mutate(patient = stringr::str_c("MRD_Pool", pool),
+                USI     = stringr::str_c("MRD_Pool", pool)) |>
+  unique()
+```
+
+### Set MRD colour palette
+
+```{r color-palette}
+# Okabe-Ito palette — colour-blind safe
+okabe_ito_colors <- unname(grDevices::palette.colors(palette = "Okabe-Ito"))
+
+mrd_pool_colors <- c(
+  "2"          = okabe_ito_colors[2],
+  "3"          = okabe_ito_colors[3],
+  "5"          = okabe_ito_colors[4],
+  "6"          = okabe_ito_colors[8],
+  "Not pooled" = okabe_ito_colors[1]
+)
+```
+
+---
+
+# Explore data
+
+### Mission Bio scDNA samples available
+
+```{r samples-available, fig.width=7.5, fig.height=2.5}
+samples_available_plot_object <- patient_info_df |>
+  dplyr::mutate(
+    stage   = dplyr::case_match(stage,
+                                "IDX" ~ "Initial diagnosis (IDX)",
+                                "MRD" ~ "Minimal residual disease (MRD)",
+                                "RLP" ~ "Relapse (RLP)"),
+    patient = dplyr::case_when(stringr::str_starts(USI, "P") ~ USI, TRUE ~ patient),
+    pool    = dplyr::case_when(is.na(pool) ~ "Not pooled", TRUE ~ as.character(pool))
+  ) |>
+  dplyr::mutate(pool = as.factor(pool)) |>
+  dplyr::count(patient, stage, pool) |>
+  dplyr::mutate(n = ifelse(n == 1, "", n)) |>
+  ggplot2::ggplot(ggplot2::aes(x = patient, y = forcats::fct_rev(stage),
+                               fill = pool, label = n)) +
+  ggplot2::geom_tile() +
+  ggplot2::geom_text(color = "white") +
+  ggplot2::labs(title = "Patient sample availability", x = "Patient", y = NULL,
+                fill  = "MRD sample pools") +
+  ggplot2::scale_fill_manual(values = mrd_pool_colors) +
+  ggplot2::coord_equal() +
+  ggplot2::theme_bw() +
+  ggplot2::theme(legend.position  = "bottom",
+                 legend.direction = "horizontal",
+                 axis.text.x      = ggplot2::element_text(angle = 45, hjust = 1))
+
+ggplot2::ggsave(file.path(plots_pdf_dir, "samples_available.pdf"),
+                samples_available_plot_object, width = 7.5, height = 7.5 / 3)
+ggplot2::ggsave(file.path(plots_png_dir, "samples_available.png"),
+                samples_available_plot_object, width = 7.5, height = 7.5 / 3)
+samples_available_plot_object
+```
+
+Notes:
+
+- Pool 1 failed
+- Pool 4 not available on Mission Bio portal
+- PT 20, 21, 23 use a different naming scheme
+- PT 20 has 3 relapse samples
+
+### Sequenced cells vs. loaded cells
+
+```{r loaded-vs-sequenced, fig.width=7.5, fig.height=4.6}
+n_cells_df <- patient_info_df |>
+  dplyr::left_join(vcf_n_cells_df, by = c("patient", "USI", "stage", "pool")) |>
+  dplyr::mutate(
+    patient = dplyr::case_when(stringr::str_starts(USI, "P") ~ USI, TRUE ~ patient),
+    pool    = dplyr::case_when(is.na(pool) ~ "Not pooled", TRUE ~ as.character(pool))
+  ) |>
+  dplyr::mutate(pool = as.factor(pool)) |>
+  tidyr::replace_na(list(pool_proportion = 1)) |>
+  dplyr::mutate(n_cells_loaded_adj = n_cells_loaded * pool_proportion,
+                n_cells_adj        = n_cells        * pool_proportion)
+
+loaded_vs_sequenced_cells_plot_object <- n_cells_df |>
+  ggplot2::ggplot(ggplot2::aes(x = n_cells_loaded_adj, y = n_cells_adj)) +
+  ggplot2::geom_point(ggplot2::aes(color = pool), shape = 16) +
+  ggplot2::geom_abline(slope = c(0.01, 0.03, 0.05), lty = 2) +
+  ggplot2::annotate("label", x = 200000, y = .01 * 200000, label = "1%") +
+  ggplot2::annotate("label", x = 200000, y = .03 * 200000, label = "3%") +
+  ggplot2::annotate("label", x = 200000, y = .05 * 200000, label = "5%") +
+  ggplot2::scale_color_manual(values = mrd_pool_colors) +
+  ggplot2::labs(x        = "Number of cells loaded",
+                y        = "Number of sequenced barcodes",
+                title    = "Around 3% of loaded cells are sequenced",
+                subtitle = "Pooled cell counts based on estimate of loading proportion",
+                color    = "MRD sample pools") +
+  ggplot2::theme_bw() +
+  ggplot2::theme(legend.position = "bottom", legend.direction = "horizontal")
+
+ggplot2::ggsave(file.path(plots_pdf_dir, "loaded_vs_sequenced_cells.pdf"),
+                loaded_vs_sequenced_cells_plot_object, width = 7.5, height = 7.5 / phi)
+ggplot2::ggsave(file.path(plots_png_dir, "loaded_vs_sequenced_cells.png"),
+                loaded_vs_sequenced_cells_plot_object, width = 7.5, height = 7.5 / phi)
+loaded_vs_sequenced_cells_plot_object
+```
+
+### Number of cells per sample
+
+```{r n-cells, fig.width=7.5, fig.height=9.4}
+n_cells_plot_object <- n_cells_df |>
+  dplyr::mutate(stage = dplyr::case_when(
+    USI == "3984" ~ "RLP 1", USI == "4057" ~ "RLP 2",
+    USI == "4823" ~ "RLP 3", TRUE ~ stage)) |>
+  ggplot2::ggplot(ggplot2::aes(x = n_cells_adj, y = stage, fill = pool)) +
+  ggplot2::geom_col() +
+  ggplot2::facet_grid(patient ~ ., scales = "free_y", space = "free") +
+  ggplot2::labs(title    = "Number of cells (barcodes) per sample",
+                subtitle = "Pooled cell counts based on estimate of loading proportion",
+                x = "Number of cells (barcodes)", y = "Stage",
+                fill = "MRD sample pools") +
+  ggplot2::scale_fill_manual(values = mrd_pool_colors) +
+  ggplot2::theme_bw() +
+  ggplot2::theme(legend.position  = "bottom", legend.direction = "horizontal",
+                 strip.text.y.right = ggplot2::element_text(angle = 0))
+
+ggplot2::ggsave(file.path(plots_pdf_dir, "n_cells.pdf"),
+                n_cells_plot_object, height = 7.5 * 1.25, width = 7.5)
+ggplot2::ggsave(file.path(plots_png_dir, "n_cells.png"),
+                n_cells_plot_object, height = 7.5 * 1.25, width = 7.5)
+n_cells_plot_object
+```
+
+### Number of cells per IDX/MRD pair (xy)
+
+```{r n-cells-xy, fig.width=7.5, fig.height=4.6}
+n_cells_plot_object_xy <- n_cells_df |>
+  dplyr::group_by(patient) |>
+  dplyr::mutate(has_idx_mrd = "IDX" %in% stage & "MRD" %in% stage) |>
+  dplyr::ungroup() |>
+  dplyr::filter(has_idx_mrd, stage %in% c("IDX", "MRD")) |>
+  tidyr::pivot_wider(id_cols = "patient", names_from = stage,
+                     values_from = n_cells_adj) |>
+  dplyr::left_join(n_cells_df |> dplyr::filter(stage == "MRD") |>
+                     dplyr::select(patient, pool), by = "patient") |>
+  ggplot2::ggplot(ggplot2::aes(x = IDX, y = MRD, color = pool, label = patient)) +
+  ggplot2::geom_abline(lty = 2) +
+  ggplot2::geom_point() +
+  ggrepel::geom_text_repel(show.legend = FALSE) +
+  ggplot2::scale_color_manual(values = mrd_pool_colors) +
+  ggplot2::scale_x_continuous(limits = c(0, 10000)) +
+  ggplot2::scale_y_continuous(limits = c(0, 10000)) +
+  ggplot2::labs(title    = "Number of cells (barcodes) per IDX/MRD sample pair",
+                subtitle = "Pooled MRD cell counts based on estimate of loading proportion",
+                x = "Number of IDX cells (barcodes)",
+                y = "Number of MRD cells (barcodes)",
+                color = "MRD sample pool") +
+  ggplot2::theme_bw() +
+  ggplot2::theme(legend.position = "bottom", legend.direction = "horizontal")
+
+ggplot2::ggsave(file.path(plots_pdf_dir, "n_cells_xy.pdf"),
+                n_cells_plot_object_xy, height = 7.5 / phi, width = 7.5)
+ggplot2::ggsave(file.path(plots_png_dir, "n_cells_xy.png"),
+                n_cells_plot_object_xy, height = 7.5 / phi, width = 7.5)
+n_cells_plot_object_xy
+```
+
+---
+
+# Genotype quality
+
+### Distribution of GQ scores
+
+```{r gq-distribution}
+all_SNP_df <- dplyr::bind_rows(nonpooled_SNP_df, pooled_SNP_df)
+n_snps     <- nrow(all_SNP_df)
+
+# Summary table
+all_SNP_df |>
+  dplyr::mutate(`Genotype Quality` = dplyr::case_when(
+    is.na(quality)  ~ "Missing GT",
+    quality == 99   ~ "GQ = 99 (max)",
+    quality >= 20   ~ "20 <= GQ < 99",
+    TRUE            ~ "GQ < 20"
+  )) |>
+  dplyr::count(`Genotype Quality`) |>
+  dplyr::mutate(Proportion = n / n_snps) |>
+  dplyr::arrange(desc(Proportion)) |>
+  knitr::kable()
+```
+
+```{r gq-plot, fig.width=7.5, fig.height=4.6}
+prop_lt_20 <- all_SNP_df |> dplyr::filter(is.na(quality) | quality < 20)  |> nrow() / n_snps
+prop_lt_99 <- all_SNP_df |> dplyr::filter(is.na(quality) | quality < 99)  |> nrow() / n_snps
+
+gq_distribution_plot_object <- all_SNP_df |>
+  dplyr::mutate(quality = ifelse(is.na(quality), -1, quality)) |>
+  dplyr::arrange(quality) |>
+  dplyr::count(quality) |>
+  dplyr::mutate(cum_sum  = cumsum(n),
+                cum_prop = cum_sum / n_snps) |>
+  ggplot2::ggplot(ggplot2::aes(x = quality, y = cum_prop)) +
+  ggplot2::geom_line() +
+  ggplot2::geom_hline(yintercept = c(prop_lt_20, prop_lt_99), lty = 2, color = "red") +
+  ggplot2::annotate("text", label = "GQ < 20", x = -1, y = prop_lt_20 - 0.01,
+                    hjust = 0, vjust = 1, color = "red") +
+  ggplot2::annotate("text", label = "GQ < 99", x = -1, y = prop_lt_99 - 0.01,
+                    hjust = 0, vjust = 1, color = "red") +
+  ggplot2::scale_x_continuous(breaks = c(-1, 0, 20, 99),
+                               minor_breaks = NULL,
+                               labels = c("", 0, 20, 99)) +
+  ggplot2::scale_y_continuous(breaks = seq(0, 1, .1), limits = c(0, 1),
+                               labels = scales::percent) +
+  ggplot2::labs(x     = "Genotype Quality",
+                y     = "Cumulative Percentage",
+                title = "Over 80% of genotype calls are useful; over 50% have maximum quality") +
+  ggplot2::theme_bw()
+
+ggplot2::ggsave(file.path(plots_pdf_dir, "gq_distribution.pdf"),
+                gq_distribution_plot_object, width = 7.5, height = 7.5 / phi)
+ggplot2::ggsave(file.path(plots_png_dir, "gq_distribution.png"),
+                gq_distribution_plot_object, width = 7.5, height = 7.5 / phi)
+gq_distribution_plot_object
+```
+
+---
+
+# Consensus genotypes for non-pooled samples
+
+```{r consensus-genotypes}
+# Build three parallel structures over USI > stage > variant:
+#   - proportion of cells with a consistent genotype  (for QC violin)
+#   - consensus allele string                          (for matching)
+#   - consensus genotype string                        (for pool-level plots)
+build_nested_list <- function(snp_df, fn_args) {
+  split(snp_df, f = snp_df$USI) |>
+    purrr::map(\(x) split(x, f = x$stage)) |>
+    purrr::map_depth(.depth = 2, .f = \(y) split(y, f = y$variant)) |>
+    purrr::map_depth(.depth = 3, .f = \(z) do.call(get_consensus_genotype,
+                                                      c(list(snp_df = z), fn_args)))
+}
+
+nonpooled_genotype_props_list   <- build_nested_list(nonpooled_SNP_df,
+                                                      list(return_prop = TRUE))
+nonpooled_genotype_alleles_list <- build_nested_list(nonpooled_SNP_df, list())
+nonpooled_genotype_list         <- build_nested_list(nonpooled_SNP_df,
+                                                      list(return_genotype = TRUE))
+```
+
+### Percentage of cells with a consensus genotype
+
+```{r consensus-violin}
+nonpooled_genotype_props_list |>
+  reshape2::melt() |>
+  dplyr::rename(Variant = L3) |>
+  ggplot2::ggplot(ggplot2::aes(x = Variant, y = value)) +
+  ggplot2::geom_violin(draw_quantiles = 0.5) +
+  ggplot2::geom_hline(yintercept = 0.95, lty = 2, color = "red") +
+  ggplot2::geom_jitter(shape = 16, alpha = 0.25, width = 0.1, height = 0) +
+  ggplot2::scale_y_continuous(labels = scales::percent) +
+  ggplot2::labs(y     = "Percentage of cells",
+                title = "Percentage of cells with a consistent genotype") +
+  ggplot2::theme_bw() +
+  ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 45, hjust = 1))
+```
+
+### Genotypes of pooled MRD samples
+
+```{r pooled-patients}
+pooled_mrd_samples <- patient_info_df |>
+  split(patient_info_df$pool) |>
+  purrr::map(\(x) x |> dplyr::pull(patient))
+
+patient_idx_usi_in_mrd_pool_df <- patient_info_df |>
+  dplyr::filter(stage %in% c("IDX", "MRD")) |>
+  tidyr::pivot_wider(id_cols     = c(patient),
+                     names_from  = stage,
+                     values_from = c(pool, USI)) |>
+  dplyr::filter(!is.na(pool_MRD)) |>
+  dplyr::select(-pool_IDX) |>
+  dplyr::mutate(pool_MRD = as.character(pool_MRD))
+```
+
+```{r consensus-by-pool-tile}
+# Tile plot: IDX consensus genotype proportion per variant per pool
+nonpooled_genotype_props_list |>
+  reshape2::melt() |>
+  dplyr::select(USI = L1, stage = L2, variant = L3, proportion = value) |>
+  dplyr::filter(stage == "IDX", USI %in% patient_idx_usi_in_mrd_pool_df$USI_IDX) |>
+  dplyr::left_join(patient_idx_usi_in_mrd_pool_df, by = c("USI" = "USI_IDX")) |>
+  dplyr::mutate(
+    value_discrete = dplyr::case_when(
+      proportion == 1    ~ "100%",
+      proportion >= 0.95 ~ ">= 95%",
+      proportion >= 0.90 ~ ">= 90%",
+      TRUE               ~ "< 90%"
+    ),
+    value_discrete        = factor(value_discrete,
+                                   levels  = c("100%", ">= 95%", ">= 90%", "< 90%"),
+                                   ordered = TRUE),
+    mrd_pool              = stringr::str_c("Pool ", pool_MRD),
+    IDX_sample_display_name = ifelse(USI == USI_MRD, USI,
+                                     stringr::str_c(patient, ": ", USI))
+  ) |>
+  ggplot2::ggplot(ggplot2::aes(x = variant, y = IDX_sample_display_name,
+                               fill = value_discrete)) +
+  ggplot2::geom_tile() +
+  ggplot2::facet_grid(rows = dplyr::vars(pool_MRD), space = "free", scales = "free") +
+  ggplot2::scale_fill_brewer(palette = "PuOr", direction = -1) +
+  ggplot2::labs(x     = "Variant", y = "IDX sample",
+                title = "SNPs show consistent consensus genotypes",
+                fill  = "Percentage of cells\nwith consistent genotype") +
+  ggplot2::theme_bw() +
+  ggplot2::theme(axis.text.x    = ggplot2::element_text(angle = 45, hjust = 1),
+                 legend.position  = "bottom",
+                 legend.direction = "horizontal")
+```
+
+```{r consensus-genotype-by-pool-plot}
+# Tile plot: actual consensus genotype (hom-ref, het, hom-alt) per variant
+consensus_genotypes_by_pool_plot_object <- nonpooled_genotype_list |>
+  reshape2::melt() |>
+  dplyr::select(USI = L1, stage = L2, variant = L3, genotype = value) |>
+  dplyr::filter(stage == "IDX", USI %in% patient_idx_usi_in_mrd_pool_df$USI_IDX) |>
+  dplyr::left_join(patient_idx_usi_in_mrd_pool_df, by = c("USI" = "USI_IDX")) |>
+  dplyr::mutate(mrd_pool = stringr::str_c("Pool ", pool_MRD),
+                IDX_sample_display_name = ifelse(USI == USI_MRD, USI,
+                                                  stringr::str_c(patient, ": ", USI))) |>
+  ggplot2::ggplot(ggplot2::aes(x = variant, y = IDX_sample_display_name,
+                               fill = genotype)) +
+  ggplot2::geom_tile() +
+  ggplot2::facet_grid(rows = dplyr::vars(pool_MRD), space = "free", scales = "free") +
+  ggplot2::scale_fill_brewer(palette = "Greens", direction = -1) +
+  ggplot2::labs(y     = "IDX sample",
+                title = "SNPs provide informative differences within pool",
+                fill  = "Consensus genotype") +
+  ggplot2::theme_bw() +
+  ggplot2::theme(axis.text.x    = ggplot2::element_text(angle = 45, hjust = 1),
+                 legend.position  = "bottom",
+                 legend.direction = "horizontal")
+
+ggplot2::ggsave(file.path(plots_pdf_dir, "consensus_genotypes_by_pool.pdf"),
+                consensus_genotypes_by_pool_plot_object, width = 7.5, height = 7.5 / phi)
+ggplot2::ggsave(file.path(plots_png_dir, "consensus_genotypes_by_pool.png"),
+                consensus_genotypes_by_pool_plot_object, width = 7.5, height = 7.5 / phi)
+consensus_genotypes_by_pool_plot_object
+```
+
+### Comparing two potentially mislabelled samples
+
+PAPHWH (MRD) and PAYMKH (IDX) were flagged as potentially swapped.
+
+```{r suspect-samples}
+nonpooled_genotype_alleles_list |>
+  reshape2::melt() |>
+  dplyr::filter(L1 %in% c("PAPHWH", "PAYMKH"), L2 %in% c("IDX", "MRD")) |>
+  ggplot2::ggplot(ggplot2::aes(x = L3, y = L2, fill = value)) +
+  ggplot2::geom_tile() +
+  ggplot2::facet_grid(rows = dplyr::vars(L1), space = "free", scales = "free") +
+  ggplot2::labs(x     = "Variant", y = "Stage",
+                title = "PAPHWH and PAYMKH paired samples are internally consistent",
+                fill  = "Consensus alleles") +
+  ggplot2::theme_bw() +
+  ggplot2::theme(axis.text.x    = ggplot2::element_text(angle = 45, hjust = 1),
+                 legend.position  = "bottom",
+                 legend.direction = "horizontal")
+```
+
+---
+
+# Distance metric
+
+$$\text{Normalised Hamming distance (H)} = 1 - \frac{\text{# matching alleles}}{\text{# non-missing alleles}}$$
+
+### Non-pooled IDX/MRD pairs
+
+```{r nonpooled-hamming}
+known_pairs <- c("PAPDNB", "PAPDUV", "PAPHWH", "PAXYMC",
+                 "PAYBCZ", "PAYCFJ", "PAYMKH")
+
+informative_variants_list <- purrr::map(
+  known_pairs,
+  \(x) get_informative_variants(nonpooled_genotype_alleles_list,
+                                  c(x, x), c("IDX", "MRD"))
+) |> setNames(known_pairs)
+
+npkp_mrd_cell_barcode_list <- purrr::map(
+  known_pairs,
+  \(x) nonpooled_SNP_df |>
+    dplyr::filter(USI == x, stage == "MRD") |>
+    dplyr::pull(cell_barcode) |>
+    unique()
+) |> setNames(known_pairs)
+
+npkp_mrd_SNP_df <- nonpooled_SNP_df |>
+  dplyr::filter(USI %in% known_pairs, stage == "MRD")
+
+npkp_mrd_cell_barcode_allele_list <- split(npkp_mrd_SNP_df,
+                                            f = npkp_mrd_SNP_df$USI) |>
+  purrr::map(\(x) split(x, x$cell_barcode)) |>
+  purrr::map_depth(.depth = 2, .f = get_cell_alleles)
+
+# Compute Hamming distance for each MRD barcode vs. its IDX consensus
+npkp_hamm_list <- purrr::map(known_pairs, \(pt) {
+  purrr::map(npkp_mrd_cell_barcode_list[[pt]], \(bc) {
+    norm_hamm_dist(
+      nonpooled_genotype_alleles_list[[pt]][["IDX"]],
+      npkp_mrd_cell_barcode_allele_list[[pt]][[bc]],
+      informative_variants_list[[pt]],
+      possible_alleles = nonpooled_genotype_alleles_list[[pt]][["IDX"]]
+    )
+  }) |> setNames(npkp_mrd_cell_barcode_list[[pt]])
+}) |> setNames(known_pairs)
+```
+
+```{r nonpooled-hamming-plot}
+known_pair_hamming_distribution_plot_object <- npkp_hamm_list |>
+  reshape2::melt() |>
+  dplyr::mutate(
+    value = dplyr::case_when(
+      is.na(value)  ~ "Missing",
+      value == 0    ~ "H = 0",
+      value < 0.1   ~ "H < 0.1",
+      value < 0.2   ~ "H < 0.2",
+      value < 0.3   ~ "H < 0.3",
+      value < 0.4   ~ "H < 0.4",
+      value < 0.5   ~ "H < 0.5",
+      value >= 0.5  ~ "H >= 0.5"
+    ),
+    value = factor(value,
+                   levels  = c("H = 0", "H < 0.1", "H < 0.2", "H < 0.3",
+                                "H < 0.4", "H < 0.5", "H >= 0.5", "Missing"),
+                   ordered = TRUE)
+  ) |>
+  dplyr::count(value, L1) |>
+  ggplot2::ggplot(ggplot2::aes(x = L1, y = n,
+                               fill = forcats::fct_rev(value))) +
+  ggplot2::geom_col(position = "fill") +
+  ggplot2::scale_y_continuous(labels = scales::percent) +
+  ggplot2::labs(x     = "Patient",
+                y     = "Percentage",
+                fill  = "Distance",
+                title = "Distance between MRD barcodes and IDX consensus alleles") +
+  ggplot2::theme_bw()
+
+ggplot2::ggsave(file.path(plots_pdf_dir, "known_pair_hamming_distribution.pdf"),
+                known_pair_hamming_distribution_plot_object,
+                width = 7.5, height = 7.5 / phi)
+ggplot2::ggsave(file.path(plots_png_dir, "known_pair_hamming_distribution.png"),
+                known_pair_hamming_distribution_plot_object,
+                width = 7.5, height = 7.5 / phi)
+known_pair_hamming_distribution_plot_object
+```
+
+---
+
+# Pooled IDX and MRD samples
+
+### Informative variants distinguish between pooled samples
+
+```{r pooled-informative-variants}
+# Informative variants are those non-missing in all IDX samples within a pool
+# AND differing across at least two samples (keep_same_alleles = FALSE)
+informative_variants_list <- purrr::map(
+  c("2", "3", "5", "6"),
+  \(x) get_informative_variants(
+    nonpooled_genotype_alleles_list,
+    sample_ids = patient_idx_usi_in_mrd_pool_df |>
+      dplyr::filter(pool_MRD == x) |>
+      dplyr::pull(USI_IDX),
+    stages = rep("IDX", length(pooled_mrd_samples[[x]])),
+    keep_same_alleles = FALSE
+  )
+) |> setNames(c("2", "3", "5", "6"))
+```
+
+### Calculate H for pooled samples
+
+```{r pooled-hamming}
+pooled_allele_list <- split(pooled_SNP_df, f = pooled_SNP_df$pool) |>
+  purrr::map(\(x) split(x, x$cell_barcode)) |>
+  purrr::map_depth(.depth = 2, .f = get_cell_alleles)
+
+pooled_IDX_usi_list <- patient_idx_usi_in_mrd_pool_df |>
+  split(patient_idx_usi_in_mrd_pool_df$pool_MRD) |>
+  purrr::map(\(x) x$USI_IDX)
+
+h_cutoff <- 0.5
+
+pool_hamm_list <- purrr::map(c("2", "3", "5", "6"), \(pool) {
+  # Build combined possible-allele list across all IDX samples in this pool
+  possible_alleles_list <- nonpooled_genotype_alleles_list[[
+    pooled_IDX_usi_list[[pool]][1]]][["IDX"]]
+
+  for (pt in pooled_IDX_usi_list[[pool]][-1]) {
+    possible_alleles_list <- purrr::map2(
+      possible_alleles_list,
+      nonpooled_genotype_alleles_list[[pt]][["IDX"]],
+      c
+    )
+  }
+
+  purrr::map(names(pooled_allele_list[[pool]]), \(bc) {
+    purrr::map(pooled_IDX_usi_list[[pool]], \(pt) {
+      norm_hamm_dist(
+        nonpooled_genotype_alleles_list[[pt]][["IDX"]],
+        pooled_allele_list[[pool]][[bc]],
+        informative_variants_list[[pool]],
+        possible_alleles = possible_alleles_list
+      )
+    }) |> setNames(pooled_IDX_usi_list[[pool]])
+  }) |> setNames(names(pooled_allele_list[[pool]]))
+}) |> setNames(c("2", "3", "5", "6"))
+```
+
+### Pool 2 — PAVXLK + PARNLW + PAVEPS (three-sample pool)
+
+Pool 2 contains three IDX samples, so the Hamming distances form a 3D
+simplex. A ternary plot (ggtern) is appropriate here; pools with only two
+samples use standard xy scatter plots below.
+
+```{r pool-2-ternary}
+pool_2_plot_object <- pool_hamm_list |>
+  reshape2::melt() |>
+  dplyr::filter(L1 == "2") |>
+  tidyr::pivot_wider(names_from = L3, values_from = value) |>
+  dplyr::count(PAVXLK, PARNLW, PAVEPS) |>
+  dplyr::mutate(assigned_to = dplyr::case_when(
+    PAVXLK < h_cutoff & PARNLW > h_cutoff & PAVEPS > h_cutoff ~ "PAVXLK",
+    PAVXLK > h_cutoff & PARNLW < h_cutoff & PAVEPS > h_cutoff ~ "PARNLW",
+    PAVXLK > h_cutoff & PARNLW > h_cutoff & PAVEPS < h_cutoff ~ "PAVEPS",
+    TRUE ~ "None"
+  )) |>
+  ggtern::ggtern(ggtern::aes(x = PAVXLK, y = PARNLW, z = PAVEPS,
+                              color = assigned_to, size = n)) +
+  ggplot2::geom_point(shape = 16) +
+  ggplot2::labs(title = "Hamming distance of pooled barcodes:\nPAVXLK + PARNLW + PAVEPS (Pool 2)",
+                size  = "Number of\nbarcodes",
+                color = "Assigned") +
+  ggplot2::theme_bw()
+
+pool_2_plot_object
+```
+
+### Pool 3 — PAWVAB + PAXPPX
+
+```{r pool-3}
+pool_3_plot_object <- pool_hamm_list |>
+  reshape2::melt() |>
+  dplyr::filter(L1 == "3") |>
+  tidyr::pivot_wider(names_from = L3, values_from = value) |>
+  dplyr::count(PAWVAB, PAXPPX) |>
+  dplyr::mutate(assigned_to = dplyr::case_when(
+    PAWVAB < h_cutoff & PAXPPX > h_cutoff ~ "PAWVAB",
+    PAWVAB > h_cutoff & PAXPPX < h_cutoff ~ "PAXPPX",
+    TRUE ~ "Neither"
+  )) |>
+  ggplot2::ggplot(ggplot2::aes(x = PAWVAB, y = PAXPPX, label = n)) +
+  ggplot2::geom_point(ggplot2::aes(size = n, color = assigned_to), shape = 16) +
+  ggplot2::geom_text() +
+  ggplot2::scale_x_continuous(limits = c(0, 1)) +
+  ggplot2::scale_y_continuous(limits = c(0, 1)) +
+  ggplot2::labs(title = "Hamming distance of pooled barcodes: PAWVAB + PAXPPX (Pool 3)",
+                size  = "Number of\nbarcodes", color = "Assigned") +
+  ggplot2::theme_bw()
+
+ggplot2::ggsave(file.path(plots_pdf_dir, "pool_3.pdf"),
+                pool_3_plot_object, width = 7.5, height = 7.5 / phi)
+ggplot2::ggsave(file.path(plots_png_dir, "pool_3.png"),
+                pool_3_plot_object, width = 7.5, height = 7.5 / phi)
+pool_3_plot_object
+```
+
+### Pool 5 — 4048 + 3315 (PT21 + PT23)
+
+```{r pool-5}
+pool_5_plot_object <- pool_hamm_list |>
+  reshape2::melt() |>
+  dplyr::filter(L1 == "5") |>
+  tidyr::pivot_wider(names_from = L3, values_from = value) |>
+  dplyr::count(`4048`, `3315`) |>
+  dplyr::mutate(assigned_to = dplyr::case_when(
+    `4048` < h_cutoff & `3315` > h_cutoff ~ "PT21",
+    `4048` > h_cutoff & `3315` < h_cutoff ~ "PT23",
+    TRUE ~ "Neither"
+  )) |>
+  ggplot2::ggplot(ggplot2::aes(x = `4048`, y = `3315`, label = n)) +
+  ggplot2::geom_point(ggplot2::aes(size = n, color = assigned_to), shape = 16) +
+  ggplot2::geom_text() +
+  ggplot2::scale_x_continuous(limits = c(0, 1)) +
+  ggplot2::scale_y_continuous(limits = c(0, 1)) +
+  ggplot2::labs(title  = "Hamming distance of pooled barcodes: PT21 + PT23 (Pool 5)",
+                x      = "PT21 (4048)",
+                y      = "PT23 (3315)",
+                size   = "Number of\nbarcodes",
+                color  = "Assigned") +
+  ggplot2::theme_bw()
+
+ggplot2::ggsave(file.path(plots_pdf_dir, "pool_5.pdf"),
+                pool_5_plot_object, width = 7.5, height = 7.5 / phi)
+ggplot2::ggsave(file.path(plots_png_dir, "pool_5.png"),
+                pool_5_plot_object, width = 7.5, height = 7.5 / phi)
+pool_5_plot_object
+```
+
+### Pool 6 — PAXFFK + PAYJEG
+
+```{r pool-6}
+pool_6_plot_object <- pool_hamm_list |>
+  reshape2::melt() |>
+  dplyr::filter(L1 == "6") |>
+  tidyr::pivot_wider(names_from = L3, values_from = value) |>
+  dplyr::count(PAXFFK, PAYJEG) |>
+  dplyr::mutate(assigned_to = dplyr::case_when(
+    PAXFFK < h_cutoff & PAYJEG > h_cutoff ~ "PAXFFK",
+    PAXFFK > h_cutoff & PAYJEG < h_cutoff ~ "PAYJEG",
+    TRUE ~ "Neither"
+  )) |>
+  ggplot2::ggplot(ggplot2::aes(x = PAXFFK, y = PAYJEG, label = n)) +
+  ggplot2::geom_point(ggplot2::aes(size = n, color = assigned_to), shape = 16) +
+  ggplot2::geom_text() +
+  ggplot2::scale_x_continuous(limits = c(0, 1)) +
+  ggplot2::scale_y_continuous(limits = c(0, 1)) +
+  ggplot2::labs(title = "Hamming distance of pooled barcodes: PAXFFK + PAYJEG (Pool 6)",
+                size  = "Number of\nbarcodes", color = "Assigned") +
+  ggplot2::theme_bw()
+
+ggplot2::ggsave(file.path(plots_pdf_dir, "pool_6.pdf"),
+                pool_6_plot_object, width = 7.5, height = 7.5 / phi)
+ggplot2::ggsave(file.path(plots_png_dir, "pool_6.png"),
+                pool_6_plot_object, width = 7.5, height = 7.5 / phi)
+pool_6_plot_object
+```
+
+---
+
+# Assignment summary
+
+### Barcodes assigned per pool
+
+```{r assigned-barcodes-plot}
+assigned_barcode_counts_df <- pool_hamm_list |>
+  reshape2::melt() |>
+  dplyr::group_by(L1, L2) |>
+  dplyr::summarize(n_samples   = length(unique(L3)),
+                   n_lt        = sum(value < h_cutoff, na.rm = TRUE),
+                   n_gt        = sum(value > h_cutoff, na.rm = TRUE),
+                   assigned    = n_lt + n_gt == n_samples,
+                   assigned_to = ifelse(assigned, L3[which(value < h_cutoff)], NA),
+                   n_na        = sum(is.na(value)),
+                   .groups     = "drop") |>
+  dplyr::count(L1, assigned_to) |>
+  dplyr::left_join(patient_info_df |> dplyr::select(patient, USI) |> unique(),
+                   by = c("assigned_to" = "USI")) |>
+  dplyr::mutate(
+    assigned_to = ifelse(stringr::str_starts(assigned_to, "P"), assigned_to, patient),
+    L1          = stringr::str_c("Pool ", L1)
+  )
+
+total_assigned_df <- assigned_barcode_counts_df |>
+  dplyr::filter(!is.na(assigned_to)) |>
+  dplyr::group_by(L1) |>
+  dplyr::summarize(n_total_assigned = sum(n))
+
+n_barcodes_assigned_plot_object <- assigned_barcode_counts_df |>
+  dplyr::left_join(total_assigned_df, by = "L1") |>
+  dplyr::left_join(
+    patient_info_df |>
+      dplyr::filter(!is.na(pool)) |>
+      dplyr::select(USI, pool_proportion) |>
+      dplyr::mutate(USI = dplyr::case_when(
+        USI == "4232" ~ "PT21", USI == "3398" ~ "PT23", TRUE ~ USI)),
+    by = c("assigned_to" = "USI")
+  ) |>
+  dplyr::mutate(loading_prop_text =
+                  "Expected barcodes based on cell loading proportion") |>
+  ggplot2::ggplot(ggplot2::aes(x = n, y = assigned_to, label = n)) +
+  ggplot2::geom_col() +
+  ggplot2::geom_point(ggplot2::aes(x = n_total_assigned * pool_proportion,
+                                    color = loading_prop_text), shape = 16) +
+  ggplot2::geom_text(hjust = 1, color = "white", nudge_x = -10) +
+  ggplot2::facet_wrap(~ L1, scales = "free_y", ncol = 1) +
+  ggplot2::labs(x = "Number of barcodes assigned", y = "Assigned to", color = NULL) +
+  ggplot2::scale_color_manual(values = "red") +
+  ggplot2::theme_bw() +
+  ggplot2::theme(legend.position = "bottom")
+
+ggplot2::ggsave(file.path(plots_pdf_dir, "n_barcodes_assigned.pdf"),
+                n_barcodes_assigned_plot_object, width = 7.5, height = 7.5 / phi)
+ggplot2::ggsave(file.path(plots_png_dir, "n_barcodes_assigned.png"),
+                n_barcodes_assigned_plot_object, width = 7.5, height = 7.5 / phi)
+n_barcodes_assigned_plot_object
+```
+
+### Proportion of pooled barcodes assigned
+
+```{r assigned-proportion}
+assigned_barcode_counts_df |>
+  dplyr::group_by(L1) |>
+  dplyr::summarize(n_assigned = sum(n[!is.na(assigned_to)]),
+                   n_cells    = sum(n),
+                   .groups    = "drop") |>
+  dplyr::mutate(prop_assigned = n_assigned / n_cells) |>
+  dplyr::select(Pool = L1, Assigned = n_assigned,
+                `Total cells` = n_cells, Proportion = prop_assigned) |>
+  knitr::kable()
+```
+
+### Output pooled barcode assignments
+
+```{r output-assignments}
+pool_hamm_list |>
+  reshape2::melt() |>
+  dplyr::group_by(L1, L2) |>
+  dplyr::summarize(n_samples   = length(unique(L3)),
+                   n_lt        = sum(value < h_cutoff, na.rm = TRUE),
+                   n_gt        = sum(value > h_cutoff, na.rm = TRUE),
+                   assigned    = n_lt + n_gt == n_samples,
+                   assigned_to = ifelse(assigned, L3[which(value < h_cutoff)], NA),
+                   n_na        = sum(is.na(value)),
+                   .groups     = "drop") |>
+  dplyr::select(pool = L1, barcode = L2, assigned_to) |>
+  dplyr::left_join(patient_info_df |> dplyr::filter(stage == "IDX") |>
+                     dplyr::select(USI, patient), by = c("assigned_to" = "USI")) |>
+  dplyr::left_join(patient_info_df |> dplyr::filter(stage == "MRD") |>
+                     dplyr::select(USI, patient), by = "patient") |>
+  dplyr::select(pool, barcode, assigned_to = USI) |>
+  readr::write_tsv(file = pooled_barcode_assignments_filepath)
+```
+
+---
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```

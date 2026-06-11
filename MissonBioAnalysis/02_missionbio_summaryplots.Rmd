@@ -1,0 +1,896 @@
+---
+title: "Mission Bio scDNA-seq: Cohort Mutation Summary"
+output: html_notebook
+---
+
+# Overview
+
+This notebook summarises somatic mutations detected by Mission Bio targeted
+scDNA-seq across the VHR-ALL cohort. It covers:
+
+1. **Data preparation** — load, format, and filter mutation and sample metadata
+2. **Germline SNP removal** — flag and remove variants overlapping common dbSNP entries
+3. **Mutation frequency adjustment** — correct raw mutation rates for the
+   proportion of leukemic cells loaded per sample
+4. **Gene-level heatmap** — mutation frequency per gene × patient × stage
+5. **Mutation-level heatmap** — per-variant view with identical layout
+6. **IDX → MRD frequency change** — scatterplot and histograms of change per mutation
+7. **Panel characterisation** — amplicon and mutation counts by gene and origin
+8. **PeCAN overlap** — how many cohort mutations appear in PeCAN database
+9. **Chang et al. (MP2PRT) overlap** — comparison with the Genomic Determinants
+   of Outcome in ALL publication
+
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+library(Seurat)
+library(Signac)
+library(tidyverse)
+library(ConsensusClusterPlus)
+library(data.table)
+library(ggpubr)
+library(RColorBrewer)
+library(ggrepel)
+library(pheatmap)
+library(readxl)
+library(scales)
+
+`%notin%` <- Negate(`%in%`)
+```
+
+---
+
+# USER CONFIGURATION
+
+Edit the paths in this block before running. All other chunks derive their
+inputs from these variables.
+
+```{r config}
+# Input files
+path.mut.all       <- "/path/to/filtered_mutations/filtered_mutations_gt0_meta.tsv"
+path.pt.meta       <- "/path/to/manuscript/data_used_in_plots/patient_info.tsv"
+path.k.cluster     <- "/path/to/metadata/Ctype_aggregated_scaled_LFC_k4clustering.csv"
+path.germline.common <- "/path/to/ref/dbsnp_overlaps_common.txt"
+path.germline.all    <- "/path/to/ref/dbsnp_overlaps_AllMut.txt"
+path.prop.leukemic <- "/path/to/metadata/proportion_leukemic_cells_table.txt"
+path.panel.tab     <- "/path/to/Tables/12-30-2021_final_panel_full_variant_list.csv"
+path.pecan.dir     <- "/path/to/Tables/variants"              # directory of PeCAN TSV files
+path.pecan.merged  <- "/path/to/Tables/PeCANVariants_AllCombined.tsv"  # cached merged output
+path.chang.xlsx    <- "/path/to/Tables/MP2PRT_Supplement.xlsx"
+
+# Output directory
+dir.plots <- "/path/to/MissionBio/Plots/"
+
+# Leukemia subtype renaming (applied to 'subtype' column)
+# Extend or modify as needed
+SUBTYPE_RECODE <- c(
+  "BCR-ABL"          = "Ph+",
+  "iAMP21 + Fusion"  = "iAMP21",
+  "MLL"              = "KMT2Ar"
+)
+
+# Gene pathway assignment — maps gene symbols to biological pathway groups.
+# Update this list to add or reclassify genes.
+PATHWAY_MAP <- list(
+  "RAS/MAPK Signaling"    = c("NRAS", "KRAS", "PTPN11", "FLT3", "JAK1", "JAK2", "SPRED1"),
+  "Epigenetic"            = c("CREBBP", "CHD1", "TBL1XR1", "BRD4", "EP300", "MECOM", "NSD2"),
+  "B Lineage"             = c("PAX5", "IKZF1", "IL7R", "PPARGC1A", "TRPS1", "ERG",
+                               "ROR1", "S1PR3", "SGPL1", "CPA3", "C8A"),
+  "Drug Response"         = c("NT5C2", "FPGS", "LSG1", "ELP1", "PEG10", "JUN", "PSAT1", "NR3C1"),
+  "Structural"            = c("ANK3", "SPTA1", "TTN", "MUC16", "UBR4", "LTBP1", "NCKAP5",
+                               "MYO1A", "DYNC2H1", "AHNAK2", "FERIL5", "FSIP2", "SPATA31H1", "ZNF185"),
+  "Ion Channels/Neuronal" = c("SCN8A", "SCN5A", "RYR2", "UNC79", "DLG2", "GMAT2", "NLGN1",
+                               "DCX", "CACNA1E", "GNAO1", "NDNF", "SLC4A5", "TMTC2", "TRPC3"),
+  "Trafficking"           = c("EVC2", "CNTROB", "CCDC168", "ODF1", "WDFY3", "ADGRG4",
+                               "ADGRB3", "AKAP9", "CARNS1", "CCDC50", "CEP162", "ROBO1"),
+  "DNA Repair"            = c("MSH2", "PMS2", "ETAA1", "MSH6", "TP53"),
+  "Metabolic"             = c("SLC43A3", "SLC12A1", "SLC9A4", "PAQR5", "SGPL1", "AKR1B1",
+                               "DEFB124", "SLC10A1", "SLC44A2")
+)
+
+# Subtype colours (used in pheatmap annotation)
+SUBTYPE_COLS <- c("iAMP21" = "#e41a1c", "KMT2Ar" = "#377eb8",
+                  "Ph-like" = "#4daf4a", "Ph+"     = "#984ea3")
+
+# Minimum IDX→MRD absolute difference to label a mutation in change plots
+MUT_CHANGE_LABEL_THRESHOLD <- 0.10
+
+# Minimum IDX→MRD difference for the "mutations with change >= 5%" histogram
+MUT_CHANGE_HIST_THRESHOLD <- 0.05
+```
+
+---
+
+# Section 1: Load and format data
+
+```{r load-data, message=FALSE}
+mut.all           <- fread(path.mut.all)
+pt.meta           <- read.delim(path.pt.meta)
+k_cluster         <- read.csv(path.k.cluster, row.names = 2)
+proportion.leukemic <- read_tsv(path.prop.leukemic)
+
+# Germline SNP reference sets
+# Standard VCF column names are applied manually since dbSNP overlap files
+# have no header.
+vcf_cols <- c("CHROM", "POS", "ID", "REF", "ALT", "QUAL", "FILTER",
+               "INFO", "FORMAT", "SAMPLE")
+
+format_germline_snps <- function(path) {
+  df <- read_tsv(path, col_names = FALSE)
+  colnames(df) <- vcf_cols
+  df |>
+    mutate(CHROM = paste0("chr", CHROM)) |>
+    separate_rows(ALT, sep = ",") |>
+    mutate(ID  = ifelse(is.na(ID), paste0(CHROM, "_", POS, "_", REF, "_", ALT), ID),
+           ALT = ifelse(ALT == ".", "*", ALT)) |>
+    unite(col = "combMut", CHROM, POS, REF, ALT, sep = ":", remove = FALSE)
+}
+
+germline.snps.common <- format_germline_snps(path.germline.common)
+germline.snps.all    <- format_germline_snps(path.germline.all)
+
+cat("Common germline SNPs overlapping cohort mutations:",
+    sum(germline.snps.common$combMut %in% mut.all$scDNA_variant_GRCh38), "\n")
+cat("All germline SNPs overlapping cohort mutations:",
+    sum(germline.snps.all$combMut    %in% mut.all$scDNA_variant_GRCh38), "\n")
+```
+
+---
+
+# Section 2: Identify samples for fishplots
+
+Samples where 100% of loaded cells are leukemic (proportion_leukemic_cells == 1)
+and that have more than one timepoint are candidates for clonal evolution fishplots.
+
+```{r fishplot-samples}
+all.leukemic <- proportion.leukemic |>
+  dplyr::filter(proportion_leukemic_cells == 1.00) |>
+  left_join(pt.meta |> dplyr::select(file_prefix, patient),
+            by = join_by(sample == file_prefix)) |>
+  group_by(patient) |>
+  mutate(n = n()) |>
+  dplyr::filter(n > 1)
+
+write.csv(all.leukemic,
+          file.path(dir.plots, "../Tables/AllLeukemic_samples_for_fishplots.csv"))
+```
+
+---
+
+# Section 3: Mutation frequency adjustment and filtering
+
+Raw `scDNA_prop_cells_mutated` is divided by the fraction of leukemic cells
+loaded to obtain a leukemic-cell-adjusted mutation frequency. Mutations where
+the adjusted frequency exceeds the leukemic proportion (biologically impossible)
+are removed.
+
+```{r adjust-mutation-frequency}
+# Join leukemic proportion and adjust mutation rate
+mut.all <- left_join(mut.all, proportion.leukemic,
+                     by = c("multiome_sample" = "sample")) |>
+  mutate(scDNA_prop_cells_mutated_adj =
+           (scDNA_n_01 + scDNA_n_11) /
+           (scDNA_n_cells * proportion_leukemic_cells))
+
+# Remove mutations where adjusted rate exceeds leukemic proportion
+n_removed <- sum(mut.all$proportion_leukemic_cells <
+                   mut.all$scDNA_prop_cells_mutated, na.rm = TRUE)
+cat("Mutations removed (rate > leukemic proportion):", n_removed, "\n")
+mut.all <- dplyr::filter(mut.all,
+                          proportion_leukemic_cells > scDNA_prop_cells_mutated)
+
+# Build human-readable mutation string (protein change or cDNA change)
+mut.all <- mut.all |>
+  mutate(
+    aa_ref       = str_extract(VEP_Amino_acids, "^[A-Z*]"),
+    aa_alt       = str_extract(VEP_Amino_acids, "[A-Z*]$"),
+    hgvs_c_short = ifelse(!is.na(VEP_HGVSc) & VEP_HGVSc != "",
+                           str_replace(VEP_HGVSc, "^[^:]*:", ""), NA_character_),
+    mut_string   = case_when(
+      !is.na(aa_ref) & !is.na(aa_alt) & aa_ref != "" & aa_alt != "" ~
+        paste0(VEP_SYMBOL, " ", aa_ref, VEP_Protein_position, aa_alt),
+      !is.na(hgvs_c_short) & hgvs_c_short != "" ~
+        paste0(VEP_SYMBOL, " ", hgvs_c_short),
+      TRUE ~ NA_character_
+    )
+  )
+
+# Build analysis subset — apply standard QC filters
+mut.subset <- mut.all |>
+  dplyr::select(multiome_sample, scDNA_variant_GRCh38, scDNA_variant_GRCh37,
+                stage, has_scDNA, scDNA_panel_site, scDNA_mutation_called,
+                scDNA_prop_cells_mutated, multiome_support, VEP_Consequence,
+                VEP_IMPACT, VEP_SYMBOL, VEP_BIOTYPE, low_freq, repeated_indel,
+                scDNA_prop_cells_mutated_adj, proportion_leukemic_cells,
+                mut_string) |>
+  group_by(multiome_sample, .drop = FALSE) |>
+  right_join(pt.meta, by = c("multiome_sample" = "file_prefix")) |>
+  left_join(k_cluster |> dplyr::select(X, k_4_Myeloid), by = c("patient" = "X")) |>
+  group_by(patient) |>
+  complete(mrd_pct, mut_string) |>
+  fill(all_of(colnames(mut.subset)[c(2:6, 9:14)]), .direction = "downup") |>
+  mutate(across(c(multiome_support, scDNA_prop_cells_mutated), ~ replace_na(., 0))) |>
+  # Apply VEP impact and panel site filters
+  dplyr::filter(VEP_IMPACT %in% c("MODERATE", "HIGH") | scDNA_panel_site == TRUE) |>
+  dplyr::filter(VEP_SYMBOL != "OR2AJ1") |>
+  # Remove common germline variants
+  mutate(germline = if_else(scDNA_variant_GRCh38 %in%
+                               germline.snps.common$combMut, TRUE, FALSE)) |>
+  dplyr::filter(germline == FALSE) |>
+  dplyr::filter(stage.x %in% c("IDX", "MRD"))
+```
+
+---
+
+# Section 4: Build mutation.heatmap base — gene-level view
+
+`mutation.heatmap` is the data frame used to build both heatmaps. It is
+constructed twice (Sections 4 and 6) because the two heatmaps differ in their
+y-axis ordering: gene-level by `symbol_n`, mutation-level by `variant_n`.
+
+```{r build-heatmap-base-gene}
+# Helper: assign pathway labels using PATHWAY_MAP defined in config
+assign_pathway <- function(symbol_vec) {
+  result <- rep("Other", length(symbol_vec))
+  for (pathway in names(PATHWAY_MAP)) {
+    result[symbol_vec %in% PATHWAY_MAP[[pathway]]] <- pathway
+  }
+  result
+}
+
+# Helper: standardise subtype labels using SUBTYPE_RECODE
+recode_subtype <- function(subtype_vec) {
+  dplyr::recode(subtype_vec, !!!SUBTYPE_RECODE, .default = subtype_vec)
+}
+
+build_heatmap_df <- function(mut.subset) {
+  mut.subset |>
+    group_by(VEP_SYMBOL) |>
+    mutate(symbol_n = n_distinct(patient)) |>
+    ungroup() |>
+    group_by(scDNA_variant_GRCh37) |>
+    mutate(variant_n = n_distinct(patient)) |>
+    ungroup() |>
+    group_by(patient) |>
+    mutate(patient_n = n()) |>
+    ungroup() |>
+    mutate(support = case_when(
+      multiome_support > 0  & !scDNA_panel_site ~ "multiome",
+      multiome_support == 0 &  scDNA_panel_site ~ "panel site",
+      multiome_support > 0  &  scDNA_panel_site ~ "multiome & panel",
+      TRUE ~ NA_character_
+    )) |>
+    group_by(VEP_SYMBOL) |>
+    filter(all(symbol_n > 2 & symbol_n <= 15) | any(!is.na(support))) |>
+    ungroup() |>
+    mutate(pathway = assign_pathway(VEP_SYMBOL),
+           subtype = recode_subtype(subtype))
+}
+
+mutation.heatmap.gene <- build_heatmap_df(mut.subset) |>
+  mutate(
+    patient    = fct_reorder(patient,    mrd_pct,   .fun = max,  .desc = TRUE),
+    VEP_SYMBOL = fct_reorder(VEP_SYMBOL, symbol_n,  .fun = max,  .desc = FALSE),
+    pathway    = fct_reorder(pathway,    multiome_support, .fun = sum, .desc = TRUE)
+  )
+```
+
+---
+
+# Section 5: Gene-level heatmap and metadata bar
+
+```{r gene-heatmap, fig.height=6, fig.width=7}
+p1 <- mutation.heatmap.gene |>
+  ggplot() +
+  geom_tile(aes(y = VEP_SYMBOL, x = stage.y,
+                fill = scDNA_prop_cells_mutated_adj, color = support),
+            width = 1, height = 1, linewidth = 1) +
+  scale_fill_gradient(na.value = "white") +
+  scale_color_brewer(palette = "Dark2", na.value = NA) +
+  ggh4x::facet_nested(
+    pathway ~ k_4_Myeloid + patient + mrd_pct,
+    space  = "free", scales = "free", drop = TRUE,
+    resect = unit(0, "mm"), nest_line = element_line(colour = NA),
+    strip  = ggh4x::strip_nested(size = "variable")
+  ) +
+  theme_bw() +
+  theme(axis.text.x  = element_text(angle = 45, hjust = 1, size = 6),
+        axis.text.y  = element_text(size = 5),
+        legend.text  = element_text(size = 5),
+        legend.title = element_text(size = 5),
+        legend.key.size      = unit(0.125, "in"),
+        panel.background     = ggh4x::element_part_rect(side = "all", colour = "black"),
+        strip.background     = ggh4x::element_part_rect(side = "top", colour = "black"),
+        strip.text           = element_text(size = 5),
+        panel.spacing        = unit(0, "mm"))
+
+pdf(file.path(dir.plots,
+              "FilteredMutationSummary_GeneLevel_percentLeukemicAdj.pdf"),
+    height = 6, width = 7)
+p1
+dev.off()
+
+# Metadata bar (MRD% and subtype annotation for pheatmap)
+meta.subset.gene <- mutation.heatmap.gene |>
+  ungroup() |>
+  select(multiome_sample, stage.y, subtype, patient, mrd_pct) |>
+  distinct() |>
+  mutate(patient  = fct_reorder(patient, mrd_pct, .fun = max, .desc = TRUE),
+         subtype  = factor(subtype, levels = c("iAMP21", "KMT2Ar", "Ph-like", "Ph+"))) |>
+  arrange(subtype, desc(mrd_pct))
+
+sample.order.gene <- meta.subset.gene$multiome_sample
+cols24 <- colorRampPalette(brewer.pal(9, "Set1"))(24)
+names(cols24) <- unique(meta.subset.gene$patient)
+
+mrd.mat <- meta.subset.gene |>
+  select(multiome_sample, mrd_pct) |>
+  data.frame() |>
+  (\(x) { rownames(x) <- x$multiome_sample; x$multiome_sample <- NULL; x })() |>
+  (\(x) { x[x > 0.05] <- 0.05; t(as.matrix(x)) })()
+
+anno <- meta.subset.gene |>
+  select(multiome_sample, patient, subtype) |>
+  data.frame() |>
+  (\(x) { rownames(x) <- x$multiome_sample; x$multiome_sample <- NULL; x })()
+
+p2 <- pheatmap::pheatmap(
+  mrd.mat,
+  color               = colorRampPalette(brewer.pal(9, "Reds"))(100),
+  cluster_rows        = FALSE, cluster_cols = FALSE,
+  show_colnames       = TRUE, show_rownames = TRUE,
+  annotation_col      = anno, annotation_names_col = TRUE,
+  annotation_colors   = list(subtype = SUBTYPE_COLS, patient = cols24),
+  fontsize            = 8
+)
+
+ggsave(p2,
+       filename = file.path(dir.plots,
+                             "FilteredMutationSummary_GeneLevel_Metadata.eps"),
+       width = 16, height = 6, device = "eps")
+```
+
+---
+
+# Section 6: Build mutation.heatmap base — mutation-level view
+
+Rebuilt from `mut.subset` with y-axis ordered by `variant_n` (per-variant
+patient frequency) rather than `symbol_n`, and using `mut_string` on the y-axis
+instead of `VEP_SYMBOL`.
+
+```{r build-heatmap-base-mutation}
+mutation.heatmap.mut <- build_heatmap_df(mut.subset) |>
+  mutate(
+    patient               = fct_reorder(patient, mrd_pct, .fun = max, .desc = TRUE),
+    mut_string            = fct_reorder(mut_string, variant_n, .fun = max, .desc = FALSE),
+    scDNA_variant_GRCh38  = fct_reorder(scDNA_variant_GRCh38, variant_n, .fun = max, .desc = FALSE),
+    VEP_SYMBOL            = fct_reorder(VEP_SYMBOL, symbol_n, .fun = max, .desc = TRUE),
+    pathway               = fct_reorder(pathway, multiome_support, .fun = sum, .desc = TRUE)
+  )
+```
+
+---
+
+# Section 7: Mutation-level heatmap
+
+```{r mutation-heatmap, fig.height=12, fig.width=10}
+p1 <- mutation.heatmap.mut |>
+  ggplot() +
+  geom_tile(aes(y = mut_string, x = stage.y,
+                fill = scDNA_prop_cells_mutated_adj, color = support),
+            width = 1, height = 1, linewidth = 1) +
+  scale_fill_gradient(na.value = "white") +
+  scale_color_brewer(palette = "Dark2", na.value = NA) +
+  ggh4x::facet_nested(
+    pathway + VEP_SYMBOL ~ subtype + patient + mrd_pct,
+    space  = "free", scales = "free", drop = TRUE,
+    resect = unit(0, "mm"), nest_line = element_line(colour = NA),
+    strip  = ggh4x::strip_nested(size = "variable")
+  ) +
+  theme_bw() +
+  theme(axis.text.x  = element_text(angle = 45, hjust = 1, size = 6),
+        axis.text.y  = element_text(size = 4),
+        legend.text  = element_text(size = 5), legend.title = element_text(size = 5),
+        legend.key.size     = unit(0.125, "in"),
+        panel.background    = ggh4x::element_part_rect(side = "all", colour = "black"),
+        strip.background    = ggh4x::element_part_rect(side = "top", colour = "black"),
+        strip.text          = element_text(size = 5),
+        strip.text.y.right  = element_text(angle = 0),
+        panel.spacing       = unit(0, "mm"))
+
+pdf(file.path(dir.plots,
+              "FilteredMutationSummary_MutationLevel_percentLeukemicAdj.pdf"),
+    height = 12, width = 10)
+p1
+dev.off()
+```
+
+---
+
+# Section 8: IDX → MRD mutation frequency change
+
+## Top 15 most mutated genes at IDX and MRD
+
+```{r top-mutated-genes}
+# Build IDX/MRD wide table for paired comparisons
+# idx_mrd_diff = MRD − IDX (positive = increased at MRD)
+mutRatediff.df <- mutation.heatmap.mut |>
+  left_join(pt.meta, by = c("multiome_sample" = "file_prefix")) |>
+  filter(stage.x %in% c("IDX", "MRD"),
+         low_freq == FALSE, repeated_indel == FALSE,
+         !is.na(VEP_SYMBOL), VEP_BIOTYPE == "protein_coding",
+         VEP_IMPACT %in% c("HIGH", "MODERATE")) |>
+  dplyr::select(patient.x, multiome_sample, stage.x, scDNA_variant_GRCh37,
+                scDNA_prop_cells_mutated_adj, VEP_SYMBOL, VEP_IMPACT, support) |>
+  tidyr::complete(nesting(patient.x, scDNA_variant_GRCh37, VEP_SYMBOL,
+                           VEP_IMPACT, support), stage.x) |>
+  pivot_wider(id_cols     = c("patient.x", "scDNA_variant_GRCh37", "VEP_SYMBOL",
+                               "VEP_IMPACT", "support"),
+              names_from  = "stage.x",
+              values_from = c("multiome_sample", "scDNA_prop_cells_mutated_adj")) |>
+  replace_na(list(scDNA_prop_cells_mutated_adj_IDX = 0,
+                  scDNA_prop_cells_mutated_adj_MRD = 0)) |>
+  mutate(idx_mrd_diff = scDNA_prop_cells_mutated_adj_MRD -
+                        scDNA_prop_cells_mutated_adj_IDX)
+
+# Helper: top 15 most-mutated genes at a given timepoint
+plot_top_mut_genes <- function(df, stage_col, stage_label) {
+  top_genes <- df |>
+    filter(.data[[stage_col]] > 0) |>
+    group_by(VEP_SYMBOL) |>
+    summarise(distinctPt = n_distinct(patient.x), .groups = "drop") |>
+    slice_max(order_by = distinctPt, n = 15, with_ties = TRUE)
+
+  plot_data <- df |>
+    filter(VEP_SYMBOL %in% top_genes$VEP_SYMBOL,
+           .data[[stage_col]] > 0) |>
+    group_by(VEP_SYMBOL) |>
+    summarise(n_pat = n_distinct(patient.x), .groups = "drop") |>
+    arrange(n_pat)
+
+  df |>
+    filter(VEP_SYMBOL %in% plot_data$VEP_SYMBOL,
+           .data[[stage_col]] > 0) |>
+    mutate(VEP_SYMBOL = factor(VEP_SYMBOL, levels = plot_data$VEP_SYMBOL)) |>
+    ggplot(aes(y = VEP_SYMBOL, x = .data[[stage_col]])) +
+    geom_boxplot(outlier.shape = NA) +
+    geom_jitter(aes(color = support, shape = VEP_IMPACT),
+                size = 1.5, alpha = 0.8) +
+    geom_text(data = plot_data,
+              aes(x = 0.85, y = VEP_SYMBOL,
+                  label = paste0("n = ", n_pat)),
+              hjust = 0.5, vjust = 1.2, size = 3) +
+    scale_color_brewer(palette = "Set1", na.value = "darkgray") +
+    xlim(0, 1) +
+    labs(x     = paste(stage_label, "Adj. Mutation Proportion"),
+         y     = "Genes",
+         title = paste("Top 15 Most Mutated Genes at", stage_label, "by Patient")) +
+    theme_bw()
+}
+
+p.mrd <- plot_top_mut_genes(mutRatediff.df, "scDNA_prop_cells_mutated_adj_MRD", "MRD")
+p.idx <- plot_top_mut_genes(mutRatediff.df, "scDNA_prop_cells_mutated_adj_IDX", "IDX")
+
+pdf(file.path(dir.plots, "AdjMutRankedByPatientFrequency.pdf"), height = 5, width = 8)
+ggarrange(plotlist = list(p.mrd, p.idx), legend = "right", common.legend = TRUE)
+dev.off()
+```
+
+## Frequency change histograms and scatter
+
+```{r mut-change-plots}
+# All-sample histogram of IDX→MRD difference
+n_small_change <- sum(mutRatediff.df$idx_mrd_diff < MUT_CHANGE_HIST_THRESHOLD,
+                       na.rm = TRUE)
+
+p.hist <- ggplot(mutRatediff.df, aes(x = idx_mrd_diff)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "black") +
+  annotate("text", x = 0.5, y = 125, hjust = 1, vjust = 1.1,
+           label = paste("Mutations with d < 5%:", n_small_change, "of",
+                          nrow(mutRatediff.df)), size = 3.5) +
+  labs(x = "Difference in Mutation Frequency (MRD \u2212 IDX)", y = "Mutations") +
+  theme_bw()
+
+# 100% leukemic samples only
+mutRatediff_AllLeuk.df <- mutation.heatmap.mut |>
+  left_join(pt.meta, by = c("multiome_sample" = "file_prefix")) |>
+  filter(stage.x %in% c("IDX", "MRD"),
+         low_freq == FALSE, repeated_indel == FALSE,
+         !is.na(VEP_SYMBOL), VEP_BIOTYPE == "protein_coding",
+         VEP_IMPACT %in% c("HIGH", "MODERATE"),
+         proportion_leukemic_cells == 1) |>
+  dplyr::select(patient.x, multiome_sample, stage.x, scDNA_variant_GRCh37,
+                scDNA_prop_cells_mutated_adj, VEP_SYMBOL, VEP_IMPACT, support) |>
+  tidyr::complete(nesting(patient.x, scDNA_variant_GRCh37, VEP_SYMBOL,
+                           VEP_IMPACT, support), stage.x) |>
+  pivot_wider(id_cols     = c("patient.x", "scDNA_variant_GRCh37", "VEP_SYMBOL",
+                               "VEP_IMPACT", "support"),
+              names_from  = "stage.x",
+              values_from = c("multiome_sample", "scDNA_prop_cells_mutated_adj")) |>
+  replace_na(list(scDNA_prop_cells_mutated_adj_IDX = 0,
+                  scDNA_prop_cells_mutated_adj_MRD = 0)) |>
+  mutate(idx_mrd_diff = scDNA_prop_cells_mutated_adj_MRD -
+                        scDNA_prop_cells_mutated_adj_IDX)
+
+n_small_change_leuk <- sum(mutRatediff_AllLeuk.df$idx_mrd_diff <
+                              MUT_CHANGE_HIST_THRESHOLD, na.rm = TRUE)
+
+p.hist.leuk <- ggplot(mutRatediff_AllLeuk.df, aes(x = idx_mrd_diff)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "black") +
+  annotate("text", x = 0.5, y = 125, hjust = 1, vjust = 1.1,
+           label = paste("Mutations with d < 5%:", n_small_change_leuk, "of",
+                          nrow(mutRatediff_AllLeuk.df)), size = 3.5) +
+  labs(x = "Difference in Mutation Frequency\n(MRD \u2212 IDX, 100% Leukemic Samples Only)",
+       y = "Mutations") +
+  theme_bw()
+
+n_gt1pct <- sum(mutRatediff.df$scDNA_prop_cells_mutated_adj_IDX > 0.01, na.rm = TRUE)
+p.hist.idx <- ggplot(mutRatediff.df, aes(x = scDNA_prop_cells_mutated_adj_IDX)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "black") +
+  annotate("text", x = 0.5, y = 125, hjust = 1, vjust = 1.1,
+           label = paste("Mutations > 1% freq:", n_gt1pct, "of",
+                          nrow(mutRatediff.df)), size = 3.5) +
+  labs(x = "IDX Mutation Frequency", y = "Mutations") +
+  theme_bw()
+
+pdf(file.path(dir.plots, "MutDiffHistogram.pdf"), height = 4, width = 4)
+p.hist; p.hist.leuk; p.hist.idx
+dev.off()
+
+# Paired change plot for genes present in > 2 patients
+mrdIncrease.df <- mutRatediff.df |>
+  group_by(VEP_SYMBOL) |>
+  mutate(avgChange_symbol     = mean(idx_mrd_diff),
+         mutSymbol_distinctPt = n_distinct(patient.x)) |>
+  ungroup() |>
+  dplyr::filter(mutSymbol_distinctPt > 2) |>
+  mutate(VEP_SYMBOL = fct_reorder(VEP_SYMBOL, mutSymbol_distinctPt))
+
+gene_labels <- mrdIncrease.df |>
+  select(VEP_SYMBOL, mutSymbol_distinctPt) |>
+  distinct() |>
+  mutate(labels = paste0(VEP_SYMBOL, " n=", mutSymbol_distinctPt))
+
+df_long <- mrdIncrease.df |>
+  pivot_longer(cols        = starts_with("scDNA_prop_cells_mutated_adj_"),
+               names_to    = "condition",
+               values_to   = "value")
+
+pdf(file.path(dir.plots, "ChangeInMutFrequency.pdf"), height = 4, width = 4)
+ggplot(df_long, aes(x = condition, y = value, fill = condition)) +
+  geom_boxplot() +
+  geom_line(aes(group = patient.x), color = "grey50", alpha = 0.7, size = 0.5) +
+  geom_point(position = position_jitterdodge(), size = 0.5) +
+  scale_x_discrete(labels = c("IDX", "MRD")) +
+  facet_wrap(~ VEP_SYMBOL) +
+  theme_bw() +
+  theme(legend.position = "none")
+dev.off()
+```
+
+## IDX vs. MRD scatter plot
+
+```{r simple-change-scatter}
+simple_change_df <- mutation.heatmap.mut |>
+  left_join(pt.meta, by = c("multiome_sample" = "file_prefix")) |>
+  filter(stage.x %in% c("IDX", "MRD"),
+         VEP_BIOTYPE == "protein_coding",
+         low_freq == FALSE, repeated_indel == FALSE, !is.na(VEP_SYMBOL)) |>
+  dplyr::select(patient.x, multiome_sample, stage.x, scDNA_variant_GRCh37,
+                scDNA_prop_cells_mutated_adj, VEP_SYMBOL, VEP_IMPACT, mut_string) |>
+  pivot_wider(id_cols     = c("patient.x", "scDNA_variant_GRCh37", "VEP_SYMBOL",
+                               "VEP_IMPACT", "mut_string"),
+              names_from  = "stage.x",
+              values_from = c("multiome_sample", "scDNA_prop_cells_mutated_adj")) |>
+  replace_na(list(scDNA_prop_cells_mutated_adj_IDX = 0,
+                  scDNA_prop_cells_mutated_adj_MRD = 0)) |>
+  mutate(idx_mrd_diff  = abs(scDNA_prop_cells_mutated_adj_IDX -
+                               scDNA_prop_cells_mutated_adj_MRD),
+         plot_label    = ifelse(idx_mrd_diff >= MUT_CHANGE_LABEL_THRESHOLD,
+                                 as.character(VEP_SYMBOL), NA))
+
+simple_change_plot <- simple_change_df |>
+  ggplot(aes(x = scDNA_prop_cells_mutated_adj_IDX,
+             y = scDNA_prop_cells_mutated_adj_MRD,
+             color = plot_label)) +
+  geom_abline() +
+  geom_point(size = 3, show.legend = FALSE) +
+  ggrepel::geom_text_repel(
+    data = . %>% filter(!is.na(plot_label)),
+    aes(label = plot_label),
+    na.rm = TRUE, max.overlaps = 40, show.legend = FALSE, size = 3
+  ) +
+  scale_x_continuous(labels = scales::percent) +
+  scale_y_continuous(labels = scales::percent) +
+  scale_color_discrete(na.value = "lightgray") +
+  labs(x        = "IDX",
+       y        = "MRD",
+       title    = "scDNA percentage of cells mutated",
+       subtitle = "Each dot is one mutation in one IDX/MRD pair") +
+  theme_bw() + theme(panel.grid = element_blank())
+
+ggsave(simple_change_plot,
+       file   = file.path(dir.plots, "simple_change_percentLeukemicAdj.pdf"),
+       height = 5, width = 5)
+
+# Histogram of MRD frequency for mutations with >= 5% change
+m <- median(simple_change_df |>
+              dplyr::filter(idx_mrd_diff >= MUT_CHANGE_HIST_THRESHOLD) |>
+              pull(scDNA_prop_cells_mutated_adj_MRD))
+
+p.mrd.hist <- ggplot(
+    simple_change_df |> dplyr::filter(idx_mrd_diff >= MUT_CHANGE_HIST_THRESHOLD),
+    aes(x = scDNA_prop_cells_mutated_adj_MRD)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "black") +
+  geom_vline(xintercept = m, color = "red", linetype = "dashed", size = 1) +
+  annotate("text", x = m, y = 30, hjust = -0.1,
+           label = paste("Median =", scales::percent(m))) +
+  labs(x = "MRD Mutation Frequency (Mutations w/ Change >= 5%)",
+       y = "Mutation Count") +
+  theme_bw()
+
+ggsave(p.mrd.hist,
+       file   = file.path(dir.plots, "MRDMutHist_Only5pctChange.pdf"),
+       height = 3, width = 4)
+```
+
+---
+
+# Section 9: Mission Bio panel characterisation
+
+```{r panel-info}
+panel.tab <- read.csv(path.panel.tab)
+
+# Amplicon counts per gene
+gene.count <- panel.tab |>
+  dplyr::select(gene, AmpID) |>
+  distinct() |>
+  filter(!is.na(AmpID)) |>
+  group_by(gene) |>
+  mutate(amp_count = n()) |>
+  ungroup() |>
+  dplyr::select(-AmpID) |>
+  distinct() |>
+  arrange(desc(amp_count))
+
+# Mutation counts per gene
+mut.count <- panel.tab |>
+  dplyr::select(gene, gene.mutation) |>
+  distinct() |>
+  filter(!is.na(gene.mutation)) |>
+  group_by(gene) |>
+  summarize(mut_count = n()) |>
+  arrange(desc(mut_count))
+
+# Standardise Mut.Origin strings (collapse ordering variants)
+mut.origin <- panel.tab |>
+  dplyr::select(gene, Mut.Origin) |>
+  distinct() |>
+  group_by(gene) |>
+  summarize(Mut.Origin = paste(sort(unique(Mut.Origin)), collapse = ", "),
+            .groups = "drop") |>
+  mutate(Mut.Origin = recode(Mut.Origin,
+    "DIAGNOSIS, RELAPSE"           = "DIAGNOSIS, RELAPSE, SOMATIC",
+    "RELAPSE"                      = "RELAPSE, SOMATIC",
+    "DIAGNOSIS"                    = "DIAGNOSIS, SOMATIC",
+    "DIAGNOSIS, SOMATIC, RELAPSE"  = "DIAGNOSIS, RELAPSE, SOMATIC",
+    "RELAPSE, DIAGNOSIS"           = "DIAGNOSIS, RELAPSE, SOMATIC",
+    "SOMATIC, RELAPSE"             = "RELAPSE, SOMATIC",
+    "SOMATIC"                      = "SOMATIC, Unknown",
+    "GERMLINE"                     = "GERMLINE, Unknown",
+    .default = Mut.Origin
+  ))
+
+gene.count <- left_join(gene.count, mut.origin, by = "gene")
+mut.count  <- left_join(mut.count,  mut.origin, by = "gene")
+
+# vals: unique Mut.Origin levels present in the data (used for consistent
+# colour scale breaks across both plots)
+vals <- unique(c(gene.count$Mut.Origin, mut.count$Mut.Origin))
+
+panel.cols <- c(
+  "#76c5ad", "#49b192", "#1b9e77",
+  "#e89f67", "#e17f35", "#d95f02",
+  "#aca9d1", "#918dc2", "#7570b3",
+  "#f17fb9", "#ec54a1", "#e7298a"
+)
+names(panel.cols) <- c(
+  "DIAGNOSIS, SOMATIC", "DIAGNOSIS, GERMLINE", "DIAGNOSIS, SOMATIC, GERMLINE",
+  "RELAPSE, SOMATIC",   "RELAPSE, GERMLINE",   "RELAPSE, SOMATIC, GERMLINE",
+  "DIAGNOSIS, RELAPSE, SOMATIC", "DIAGNOSIS, RELAPSE, GERMLINE",
+  "DIAGNOSIS, GERMLINE, RELAPSE, SOMATIC",
+  "SOMATIC, Unknown", "GERMLINE, Unknown", "SOMATIC, GERMLINE, Unknown"
+)
+
+p.amp <- gene.count |>
+  filter(amp_count > 1) |>
+  ggplot(aes(y = reorder(gene, amp_count), x = amp_count, fill = Mut.Origin)) +
+  geom_col() +
+  scale_fill_manual(values = panel.cols, breaks = vals, labels = vals) +
+  theme_bw() +
+  theme(legend.position = "bottom", legend.text = element_text(size = 5),
+        legend.title.position = "top", panel.grid = element_blank())
+
+p.mut <- mut.count |>
+  filter(mut_count > 2) |>
+  ggplot(aes(y = reorder(gene, mut_count), x = mut_count, fill = Mut.Origin)) +
+  geom_col() +
+  scale_fill_manual(values = panel.cols, breaks = vals, labels = vals) +
+  theme_bw() +
+  theme(legend.position = "bottom", legend.text = element_text(size = 5),
+        legend.title.position = "top", panel.grid = element_blank())
+
+ggsave(p.amp, file = file.path(dir.plots, "ampliconCountForMBPanel.pdf"),
+       height = 6, width = 4)
+ggsave(p.mut, file = file.path(dir.plots, "MutCountForMBPanel.pdf"),
+       height = 6, width = 4)
+```
+
+---
+
+# Section 10: PeCAN overlap
+
+```{r pecan-overlap}
+# Build merged PeCAN table from per-gene TSV files (skip if cached)
+if (!file.exists(path.pecan.merged)) {
+  pecan.files <- list.files(path.pecan.dir, pattern = "\\.tsv$", full.names = TRUE)
+  pecan.names <- sub("\\.tsv$", "", basename(pecan.files))
+  pecan.dfs   <- pecan.files |>
+    lapply(\(f) read_tsv(f, show_col_types = FALSE)) |>
+    setNames(pecan.names)
+  # Drop files missing required column
+  pecan.dfs <- pecan.dfs[sapply(pecan.dfs, \(df) "Mutation" %in% colnames(df))]
+  keep_cols <- c("Mutation", "Sample", "Specimen", "Genome pos.", "Ref", "Alt",
+                 "Mut. Origin", "Data set")
+  merged_df <- pecan.dfs |>
+    lapply(\(x) {
+      x <- dplyr::select(x, all_of(keep_cols))
+      x$gene <- NULL; x
+    }) |>
+    imap(\(df, nm) { df$gene <- nm; df }) |>
+    lapply(\(df) mutate(df, across(all_of(keep_cols), as.character))) |>
+    bind_rows() |>
+    mutate(Mutation_Combined = paste(`Genome pos.`, Ref, Alt, sep = ":"))
+  write_tsv(merged_df, path.pecan.merged)
+} else {
+  merged_df <- read_tsv(path.pecan.merged, show_col_types = FALSE)
+}
+
+cat("Cohort mutations in PeCAN:",
+    sum(mut.all$scDNA_variant_GRCh37 %in% merged_df$Mutation_Combined), "\n")
+
+merged_overlap <- merged_df |>
+  filter(Mutation_Combined %in% mut.all$scDNA_variant_GRCh37) |>
+  group_by(Mutation_Combined) |>
+  mutate(patient_n = n()) |>
+  ungroup() |>
+  dplyr::select(Mutation, Mutation_Combined, gene, patient_n) |>
+  distinct() |>
+  mutate(Mutation_Name = paste(gene, Mutation, sep = "_"),
+         Mutation_Name = reorder(Mutation_Name, -patient_n)) |>
+  left_join(mut.all |> dplyr::select(scDNA_variant_GRCh37, scDNA_panel_site) |>
+              distinct(),
+            by = c("Mutation_Combined" = "scDNA_variant_GRCh37"))
+
+p.pecan.bar <- ggplot(merged_overlap,
+                       aes(x = reorder(Mutation_Name, -patient_n),
+                           y = patient_n, fill = gene)) +
+  geom_col() + geom_text(aes(label = patient_n), vjust = -0.5, size = 3) +
+  scale_fill_viridis_d(option = "plasma") +
+  labs(x = "Mutation", y = "Patient Count", title = "Mutations by Gene") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none")
+
+# PeCAN frequency rank plot
+log1p10_trans <- trans_new(
+  name      = "log1p10",
+  transform = \(x) log10(x + 1),
+  inverse   = \(x) 10^x - 1
+)
+
+mut.count.pecan <- merged_df |>
+  dplyr::filter(Specimen == "DIAGNOSIS") |>
+  group_by(Mutation_Combined) |>
+  mutate(patient_n = n()) |>
+  ungroup() |>
+  mutate(patient_fraction = patient_n / length(unique(Sample))) |>
+  dplyr::select(Mutation_Combined, patient_n, patient_fraction, gene) |>
+  distinct(Mutation_Combined, .keep_all = TRUE) |>
+  arrange(desc(patient_fraction)) |>
+  mutate(rank    = min_rank(-patient_fraction),
+         overlap = Mutation_Combined %in% mut.all$scDNA_variant_GRCh37)
+
+pos <- position_jitter(height = 0.00025, width = 200, seed = 123)
+
+p.pecan.rank <- ggplot(mut.count.pecan, aes(x = rank, y = patient_fraction)) +
+  geom_jitter(position = pos, alpha = 0.5, aes(color = overlap)) +
+  geom_text_repel(data = subset(mut.count.pecan, overlap),
+                   aes(label = gene), position = pos,
+                   max.overlaps = 15, size = 3) +
+  ggtitle("PeCAN Mutation Frequency Across Cohort")
+
+p.pecan.hist <- ggplot(mut.count.pecan, aes(x = patient_fraction)) +
+  geom_histogram() +
+  scale_y_continuous(trans  = log1p10_trans,
+                     breaks = c(0, 1, 10, 100, 1000, 10000, 40000)) +
+  labs(x = "Fraction of Cohort with Specific Mutation",
+       y = "Frequency (log1p scale)") +
+  theme_bw()
+
+pdf(file.path(dir.plots, "PeCAN_OverlapWithFilteredMutations.pdf"),
+    height = 4, width = 6)
+p.pecan.bar; p.pecan.rank; p.pecan.hist
+dev.off()
+```
+
+---
+
+# Section 11: Chang et al. (MP2PRT) overlap
+
+```{r chang-overlap}
+mut.chang <- read_xlsx(path.chang.xlsx, sheet = 5)
+colnames(mut.chang) <- mut.chang[2, ]
+mut.chang <- mut.chang[-c(1, 2), ] |>
+  mutate(Mutation_Combined = paste(Chr, Pos, Ref, Alt, sep = ":")) |>
+  dplyr::filter(Mutation_Class.SJ != "silent")
+
+cat("Cohort mutations in MP2PRT:",
+    sum(mut.all$scDNA_variant_GRCh38 %in% mut.chang$Mutation_Combined), "\n")
+
+chang_overlap <- mut.chang |>
+  filter(Mutation_Combined %in% mut.all$scDNA_variant_GRCh38) |>
+  mutate(Mutation_Name = paste0(Gene, "_", AA_change)) |>
+  group_by(Mutation_Combined) |>
+  mutate(patient_n = n()) |>
+  ungroup() |>
+  dplyr::select(Mutation_Name, Mutation_Combined, patient_n, Gene, Subtype) |>
+  distinct() |>
+  mutate(Mutation_Name = reorder(Mutation_Name, -patient_n))
+
+p.chang.bar <- ggplot(chang_overlap,
+                       aes(x = reorder(Mutation_Name, -patient_n),
+                           y = patient_n, fill = Subtype)) +
+  geom_col(color = "white") +
+  labs(x = "Mutation", y = "Patient Count", title = "Mutations by Gene") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# MP2PRT frequency rank plot
+mut.count.mp2prt <- mut.chang |>
+  group_by(Mutation_Combined) |>
+  mutate(patient_n = n()) |>
+  ungroup() |>
+  mutate(patient_fraction = patient_n / length(unique(USI)),
+         overlap = Mutation_Combined %in% mut.all$scDNA_variant_GRCh38) |>
+  dplyr::select(Mutation_Combined, patient_n, patient_fraction, Gene, overlap) |>
+  distinct(Mutation_Combined, .keep_all = TRUE) |>
+  arrange(desc(patient_fraction)) |>
+  mutate(rank = min_rank(-patient_fraction))
+
+p.chang.rank <- ggplot(mut.count.mp2prt, aes(x = rank, y = patient_fraction)) +
+  geom_jitter(position = pos, alpha = 0.5, aes(color = overlap)) +
+  geom_text_repel(data = subset(mut.count.mp2prt, overlap),
+                   aes(label = Gene), position = pos,
+                   max.overlaps = 15, size = 3) +
+  ggtitle("MP2PRT Mutation Frequency Across Cohort (n=1496)")
+
+p.chang.hist <- ggplot(mut.count.mp2prt, aes(x = patient_fraction)) +
+  geom_histogram() +
+  scale_y_continuous(trans  = log1p10_trans,
+                     breaks = c(0, 1, 10, 100, 1000, 10000, 40000)) +
+  labs(x = "Fraction of Cohort with Specific Mutation",
+       y = "Frequency (log1p scale)") +
+  theme_bw()
+
+pdf(file.path(dir.plots, "ChangJCO_OverlapWithFilteredMutations.pdf"),
+    height = 4, width = 6)
+p.chang.bar; p.chang.rank; p.chang.hist
+dev.off()
+```
+
+---
+
+```{r session-info}
+sessionInfo()
+```

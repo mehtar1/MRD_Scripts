@@ -20,13 +20,7 @@ MRD and IDX blast cells (regressing patient ID). Genes are then filtered, adjust
 for multiple testing, and compared across dASPs via UpSet plots and common-gene
 analyses.
 
-**Stage 3 — Gene Signature Consensus Clustering and GO Enrichment**
-DEGs across all dASP × arrest-state combinations are biclustered using the BiMax
-algorithm to produce gene signatures (R_1–R_11). GO enrichment (clusterProfiler)
-and pathway enrichment (Reactome, MSigDB Hallmark) are computed per dASP and
-per signature. Final manuscript heatmaps for Hallmark and GO BP enrichment are
-assembled from pre-computed enrichment CSV tables.
-
+**Stage 3 — Manuscript GO Enrichment Plots**
 ---
 
 ```{r setup, message=FALSE, warning=FALSE}
@@ -382,9 +376,6 @@ Patient ID is regressed out as a latent variable. Cell counts are balanced
 across timepoints by capping at 10,000 cells per group. Results are
 Bonferroni-adjusted across all dASPs jointly after aggregation.
 
-> **Note:** This section takes several hours. Save the output RDS and
-> re-load on subsequent runs using `path.mast.degs`.
-
 ```{r mast-degs, eval=FALSE}
 Idents(global.rna) <- "k_cluster"
 cluster.rna.list   <- SplitObject(global.rna, split.by = "k_cluster")
@@ -444,109 +435,9 @@ markers.mrd.idx$p_val_adj <- p.adjust(markers.mrd.idx$p_val,
                                         method = "bonferroni")
 markers.mrd.idx.sig <- filter(markers.mrd.idx, p_val_adj < MAST_PADJ_CUTOFF)
 
-# Split significant DEGs by dASP and direction
-split_degs <- function(markers, lfc_direction) {
-  markers %>%
-    filter(avg_log2FC * sign(lfc_direction) > 0) %>%
-    group_by(k_cluster) %>%
-    arrange(desc(abs(avg_log2FC))) %>%
-    group_split() %>%
-    setNames(paste0("dASP_", seq_along(.)))
-}
-
-mrd.degs.by.dasp <- split_degs(markers.mrd.idx.sig,  1)
-idx.degs.by.dasp <- split_degs(markers.mrd.idx.sig, -1)
-
-mrd.input <- lapply(mrd.degs.by.dasp, pull, Gene)
-idx.input <- lapply(idx.degs.by.dasp, pull, Gene)
-names(mrd.input) <- names(idx.input) <- paste0("dASP_", 1:KMEANS_K)
-
-mrd.cluster.common <- Reduce(base::intersect, mrd.input)
-idx.cluster.common <- Reduce(base::intersect, idx.input)
-
-cat("Genes common across all dASPs (MRD-upregulated):",
-    length(mrd.cluster.common), "\n")
-cat("Genes common across all dASPs (IDX-upregulated):",
-    length(idx.cluster.common), "\n")
-
-# UpSet plots of DEG overlap across dASPs
-UpSetR::upset(fromList(mrd.input), order.by = "freq")
-grid.text("MRD-upregulated DEGs by dASP", x = 0.65, y = 0.95,
-          gp = gpar(fontsize = 12))
-
-UpSetR::upset(fromList(idx.input), order.by = "freq")
-grid.text("IDX-upregulated DEGs by dASP", x = 0.65, y = 0.95,
-          gp = gpar(fontsize = 12))
 ```
 
-## 2.4 Genes unique to each dASP
-
-```{r unique-degs}
-# Helper: for each dASP, subtract the union of all other dASPs
-get_unique <- function(gene.list) {
-  lapply(seq_along(gene.list), function(i) {
-    others <- Reduce(base::union, gene.list[-i])
-    setdiff(gene.list[[i]], others)
-  }) %>% setNames(names(gene.list))
-}
-
-unique.mrd.genes <- get_unique(mrd.input)
-unique.idx.genes <- get_unique(idx.input)
-```
-
-## 2.5 Volcano plots per dASP
-
-```{r volcano-plots, fig.width=12, fig.height=8}
-# Label genes by number of dASPs in which they are significant
-markers.mrd.idx.sig <- markers.mrd.idx.sig %>%
-  group_by(Gene) %>%
-  mutate(n_sig = as.factor(n()))
-
-pdf(file.path(dir.plots, "dASP_VolcanoPlots_MAST_DEGs.pdf"),
-    height = 8, width = 12)
-
-for (i in seq_len(KMEANS_K)) {
-  p <- markers.mrd.idx.sig %>%
-    filter(k_cluster == i) %>%
-    ggplot(aes(x = avg_log2FC, y = -log10(p_val_adj), color = n_sig)) +
-    geom_point() +
-    ggtitle(paste0("dASP ", i, " — MRD vs IDX DEGs")) +
-    theme_bw()
-  print(p)
-}
-
-dev.off()
-```
-
-## 2.6 GO enrichment on common DEGs across all dASPs
-
-```{r go-common, message=FALSE, warning=FALSE}
-# Convert gene symbols to Entrez IDs
-to_entrez <- function(genes) {
-  bitr(genes, fromType = "SYMBOL", toType = "ENTREZID",
-       OrgDb = org.Hs.eg.db) %>% pull(ENTREZID)
-}
-
-mrd.input.entrez <- lapply(mrd.input, to_entrez)
-idx.input.entrez <- lapply(idx.input, to_entrez)
-
-enrich_common <- function(entrez.list, direction) {
-  common.genes <- Reduce(base::intersect, entrez.list)
-  enrichPathway(gene = common.genes, organism = "human")
-}
-
-enrich_mrd_common_pathway <- enrich_common(mrd.input.entrez, "MRD")
-enrich_idx_common_pathway <- enrich_common(idx.input.entrez, "IDX")
-
-mutate(enrich_mrd_common_pathway, qscore = -log(p.adjust, base = 10)) %>%
-  barplot(x = "qscore") + ggtitle("MRD common DEGs — Reactome")
-
-mutate(enrich_idx_common_pathway, qscore = -log(p.adjust, base = 10)) %>%
-  barplot(x = "qscore") + ggtitle("IDX common DEGs — Reactome")
-```
-
-## 2.7 GO enrichment comparison across dASPs (compareCluster)
-
+## 2.4 GO enrichment comparison across dASPs (compareCluster)
 ```{r compare-cluster-go, message=FALSE, warning=FALSE, fig.width=16, fig.height=10}
 run_compare_go <- function(entrez.list) {
   res <- compareCluster(
@@ -583,173 +474,9 @@ enrichplot::dotplot(enrich_idx_clusters, split = "ONTOLOGY",
 dev.off()
 ```
 
-## 2.8 GSEA across dASPs
-
-```{r gsea, message=FALSE, warning=FALSE}
-# Remove ribosomal and mitochondrial genes before GSEA
-markers.subset <- markers.mrd.idx.sig %>%
-  filter(!grepl("^MT-|^RPL|^RPS", Gene)) %>%
-  dplyr::select(p_val_adj, avg_log2FC, k_cluster, Gene)
-
-entrez.ids   <- bitr(markers.subset$Gene, "SYMBOL", "ENTREZID", org.Hs.eg.db)
-markers.gsea <- left_join(markers.subset, entrez.ids,
-                           by = c("Gene" = "SYMBOL")) %>%
-  filter(!is.na(ENTREZID))
-
-trajCluster_gseGO <- compareCluster(
-  ENTREZID | avg_log2FC ~ k_cluster,
-  data    = markers.gsea,
-  fun     = "gseGO",
-  OrgDb   = org.Hs.eg.db,
-  eps     = 0
-) %>%
-  setReadable(OrgDb = org.Hs.eg.db) %>%
-  clusterProfiler::simplify()
-
-enrichplot::dotplot(trajCluster_gseGO, color = "NES",
-                    showCategory = 8) +
-  scale_colour_gradient2(low = "#2166ac", mid = "#f7f7f7",
-                          high = "#b2182b", midpoint = 0) +
-  ggtitle("GSEA GO — MRD vs IDX DEGs by dASP")
-```
-
 ---
 
-# STAGE 3: Gene Signature Consensus Clustering (BiMax) and Enrichment
-## 3.1 Load arrest-state × dASP DEG expression matrix
-
-```{r load-consensus-matrix}
-consensus.matrix     <- readRDS(path.consensus.matrix)
-binarized.mtx        <- readRDS(path.binarized.matrix)
-ctype.degs           <- readRDS(path.ctype.degs)
-
-# Convert to binary: 1 = gene is a DEG in that arrest-state × dASP column
-deg.bin.mtx          <- binarized.mtx
-deg.bin.mtx[binarized.mtx != 0] <- 1
-
-# Remove ribosomal and mitochondrial genes before biclustering
-deg.bin.mtx <- deg.bin.mtx[!grepl("^RPL|^RPS|^MT-", rownames(deg.bin.mtx)), ,
-                             drop = FALSE]
-
-# Exclude myeloid columns for the primary lymphoid-focused biclustering
-MYELOID_COLS  <- c("Myeloid-Progenitor_1", "Myeloid-Progenitor_2",
-                    "Myeloid-Progenitor_3", "Myeloid-Progenitor_4",
-                    "Mature-Myeloid_1",     "Mature-Myeloid_2",
-                    "Mature-Myeloid_3",     "Mature-Myeloid_4")
-
-deg.bin.mtx.no.myeloid <- deg.bin.mtx %>%
-  dplyr::select(-all_of(MYELOID_COLS))
-
-cat("Matrix dimensions (no myeloid):",
-    nrow(deg.bin.mtx.no.myeloid), "genes ×",
-    ncol(deg.bin.mtx.no.myeloid), "dASP×CType columns\n")
-```
-
-## 3.2 BiMax biclustering to identify gene signatures (R_1–R_11)
-
-BiMax identifies groups of genes (rows) that are co-regulated DEGs across
-a subset of dASP × arrest-state combinations (columns). Each bicluster
-becomes a named gene signature (R_1 to R_11).
-
-```{r bimax-bicluster}
-set.seed(1)
-deg_bin_res <- biclust(x         = as.matrix(deg.bin.mtx.no.myeloid),
-                        method    = BCrepBimax(),
-                        minr      = BIMAX_MIN_ROWS,
-                        minc      = BIMAX_MIN_COLS)
-
-cat("Number of biclusters (gene signatures):", deg_bin_res@Number, "\n")
-summary(deg_bin_res)
-```
-
-## 3.3 Bicluster presence matrix (which dASP×CType columns each signature spans)
-
-```{r bicluster-presence, fig.width=10, fig.height=8}
-# Order columns developmentally: by dASP cluster then by arrest state
-order_by_cluster <- c(
-  "HSC-MPP-LMPP_1", "CLP_1", "Pre-pro-B_1", "Pro-B-Pre-B_1", "Immature-Mature-B_1",
-  "HSC-MPP-LMPP_2", "CLP_2", "Pre-pro-B_2", "Pro-B-Pre-B_2", "Immature-Mature-B_2",
-  "HSC-MPP-LMPP_3", "CLP_3", "Pre-pro-B_3", "Pro-B-Pre-B_3", "Immature-Mature-B_3",
-  "HSC-MPP-LMPP_4", "CLP_4", "Pre-pro-B_4", "Pro-B-Pre-B_4", "Immature-Mature-B_4"
-)
-
-n_biclusters  <- deg_bin_res@Number
-presence.mtx  <- matrix(0, nrow = n_biclusters,
-                          ncol = ncol(deg.bin.mtx.no.myeloid))
-colnames(presence.mtx) <- colnames(deg.bin.mtx.no.myeloid)
-rownames(presence.mtx) <- paste0("R_", seq_len(n_biclusters))
-
-for (i in seq_len(n_biclusters)) {
-  presence.mtx[i, deg_bin_res@NumberxCol[i, ]] <- 1
-}
-
-presence.df <- as.data.frame(presence.mtx) %>%
-  relocate(all_of(order_by_cluster))
-
-pheatmap(presence.df, cluster_cols = FALSE, cluster_rows = FALSE,
-         gaps_col = c(5, 10, 15),
-         main = "Gene Signature (R_1–R_11) × dASP×CType Presence")
-```
-
-## 3.4 Expression heatmaps per gene signature
-
-```{r signature-expression-heatmaps, fig.width=8, fig.height=10}
-pdf(file.path(dir.plots, "GeneSignatures_BiMax_ExpressionHeatmaps.pdf"),
-    height = 10, width = 8)
-
-for (i in seq_len(n_biclusters)) {
-  current.genes <- rownames(
-    deg.bin.mtx.no.myeloid[deg_bin_res@RowxNumber[, i],
-                             deg_bin_res@NumberxCol[i, ]])
-  current.cols  <- colnames(
-    deg.bin.mtx.no.myeloid[deg_bin_res@RowxNumber[, i],
-                             deg_bin_res@NumberxCol[i, ]])
-  current.matrix <- consensus.matrix[current.genes, current.cols]
-  cutoff <- max(abs(quantile(as.matrix(current.matrix), probs = c(0.05, 0.95))))
-
-  pheatmap(current.matrix,
-           color     = colorRampPalette(c("#4575b4", "#ffffff", "#d73027"))(100),
-           breaks    = seq(-cutoff, cutoff, length.out = 100),
-           cluster_cols  = FALSE,
-           fontsize_row  = 8,
-           main = paste0("Gene Signature R_", i,
-                          " (", length(current.genes), " genes, ",
-                          length(current.cols), " columns)"))
-}
-
-dev.off()
-```
-
-## 3.5 Enrichment analysis per gene signature
-
-```{r signature-enrichment, message=FALSE, warning=FALSE}
-pdf(file.path(dir.plots, "GeneSignatures_BiMax_Enrichment.pdf"),
-    height = 8, width = 12)
-
-for (i in seq_len(n_biclusters)) {
-  current.genes <- rownames(
-    deg.bin.mtx.no.myeloid[deg_bin_res@RowxNumber[, i], ])
-
-  current.enrichment <- enrichr(genes = current.genes,
-                                 databases = ENRICHR_DATABASES)
-
-  par(mfrow = c(2, 2), mar = c(5, 20, 2, 7))
-
-  for (j in seq_along(ENRICHR_DATABASES)) {
-    barplot(
-      height    = -log10(current.enrichment[[j]]$Adjusted.P.value)[10:1],
-      names.arg = current.enrichment[[j]]$Term[10:1],
-      horiz     = TRUE, las = 1, border = FALSE, cex.names = 0.6
-    )
-    abline(v = -log10(0.05), lty = 2)
-    title(paste0("R_", i, " — ", ENRICHR_DATABASES[j]))
-  }
-}
-
-dev.off()
-```
-
-## 3.6 Manuscript heatmaps: Hallmark and GO BP enrichment (from pre-computed CSVs)
+## 3. Manuscript heatmaps: Hallmark and GO BP enrichment (from pre-computed CSVs)
 
 These panels use enrichment results pre-computed across all 11 gene signatures
 (R_1–R_11) and stored as CSV tables (from `fig2.cleanupPanels.Rmd`).

@@ -1,0 +1,3 @@
+[submodule "MissonBioAnalysis/ballad"]
+	path = MissonBioAnalysis/ballad
+	url = https://github.com/envest/ballad

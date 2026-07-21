@@ -1,0 +1,869 @@
+---
+title: "Myeloid-like Blast Differential Analysis and Figure 3 Panels"
+output: html_notebook
+---
+
+# Overview
+
+This notebook covers the full myeloid-like blast analysis pipeline in four stages:
+
+**Stage 1 — Overview plots**
+Cell composition bar charts showing how myeloid-like, HSC-like, and B-lineage
+blast frequencies vary by patient, stage, subtype, and dASP cluster.
+
+**Stage 2 — Myeloid compartment changes (IDX → MRD)**
+Paired frequency plots testing whether myeloid-like arrest-state fractions
+change significantly between diagnosis and MRD timepoints.
+
+**Stage 3 — Differential gene expression (myeloid-like vs B-lineage)**
+MAST DEGs comparing myeloid-like blasts to B-lineage blasts, run
+cohort-wide and split by subtype. Common and CD-marker genes are identified
+across subtypes using a reusable helper function.
+
+**Stage 4 — Differential TF activity (myeloid-like vs B-lineage)**
+chromVAR FindMarkers (LR test) identifying TF motifs with differential
+accessibility between blast lineages, filtered by gene expression.
+
+**Stage 5 — Figure 3 manuscript panels**
+Final figure assembly from pre-computed enrichment tables (Metascape output):
+GO diverging bar chart, myeloid TRN heatmap, B-lineage TRN heatmap,
+pseudobulk GO bar chart, and TC IDX GO tile plot.
+
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+library(gam)
+library(Seurat)
+library(Signac)
+library(dplyr)
+library(RColorBrewer)
+library(BiocParallel)
+library(ggplot2)
+library(pheatmap)
+library(ComplexHeatmap)
+library(enrichR)
+library(tibble)
+library(grid)
+library(conflicted)
+library(factoextra)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(ReactomePA)
+library(MAST)
+library(ComplexUpset)
+library(tidyr)
+library(simplifyEnrichment)
+library(rstatix)
+library(EnhancedVolcano)
+library(ggpubr)
+library(data.table)
+library(ggh4x)
+library(stringr)
+
+conflicted::conflict_prefer("select", "dplyr")
+conflicted::conflict_prefer("filter", "dplyr")
+conflicted::conflict_prefer("union",  "base")
+conflicted::conflict_prefer("setdiff","base")
+conflicted::conflict_prefer("upset",  "ComplexUpset")
+
+`%notin%` <- Negate(`%in%`)
+```
+
+---
+
+# USER CONFIGURATION
+
+```{r config}
+# ── Input files ───────────────────────────────────────────────────────────────
+
+# Global blast RNA Seurat object (IDX/MRD only)
+path.global.rna      <- "/path/to/R_Objects/global.rna.blasts.onlyidxmrd.rds"
+
+# Projection metadata CSV (UpdatedProjectionResults_AllCells)
+path.projection.meta <- "/path/to/Tables/UpdatedProjectionResults_AllCells.csv"
+
+# Subtype-specific myeloid vs B-lineage DEG RDS (written by Stage 3)
+# Set RERUN_SUBTYPE_DEGS = TRUE to re-run FindMarkers from scratch
+path.subtype.degs    <- "/path/to/Objects/subtype_myeloid_b_degs.rds"
+RERUN_SUBTYPE_DEGS   <- FALSE
+
+# Pre-computed myeloid vs B-lineage DEGs (all cells + MRD/IDX separated)
+# Written by Stage 3; loaded by Stage 5 for volcano re-plotting
+path.myl.deg.rdata   <- "/path/to/Objects/MyeloidVsB_All_SeparatedByStage.rdata"
+
+# CD marker gene set (HGNC CD gene list)
+path.cd.markers      <- "/path/to/Tables/hgnc_cd_geneset.csv"
+
+# chromVAR downsampled object and matching ATAC Seurat object
+path.chromvar        <- "/path/to/chromVAR_Obj/ChromVAR_downsample50k_fullPeaks.rds"
+path.atac.seurat     <- "/path/to/SeuratObj/seurat_ATAC_FullDataset_Downsample0.5.rds"
+
+# dASP cluster assignments CSV
+path.dasp.clusters   <- "/path/to/Tables/Ctype_aggregated_scaled_LFC_k4clustering.csv"
+
+# Blast metadata table (with k_cluster column)
+path.blast.meta      <- "/path/to/Tables/metadata_blast_aggregateCtype.csv"
+
+# ── Figure 3 panel inputs (Metascape enrichment CSVs) ─────────────────────────
+
+# GO enrichment for myeloid vs B-lineage (Metascape output)
+path.myl.go.csv      <- "/path/to/Figure3/Tables/MyeloidvsB_AllCells_HeatmapSelectedGO.csv"
+
+# TRN Metascape enrichment heatmap CSVs (one per lineage)
+path.myl.trn.csv     <- "/path/to/Scripts/TRN/MRD/Myeloid_Metascape/Enrichment_heatmap/HeatmapSelectedGO.csv"
+path.b.trn.csv       <- "/path/to/Scripts/TRN/MRD/BLineage_Metascape/Enrichment_heatmap/HeatmapSelectedGO.csv"
+
+# TC IDX GO enrichment heatmap (Metascape output, all four TC signatures)
+path.tc.idx.go.csv   <- "/path/to/Figure3/Tables/TC_IDX_Metascape/Enrichment_heatmap/HeatmapSelectedGO.csv"
+
+# ── Output directories ─────────────────────────────────────────────────────────
+dir.plots      <- "/path/to/Myeloid-Like_Blasts/Plots/"
+dir.fig3       <- "/path/to/Figures/Figure3/"
+dir.objects    <- "/path/to/Myeloid-Like_Blasts/Objects/"
+dir.tables     <- "/path/to/Myeloid-Like_Blasts/Tables/"
+
+# ── Analysis parameters ────────────────────────────────────────────────────────
+
+# Patients to exclude from frequency analysis
+EXCLUDE_PATIENTS <- c("PT17", "PT5")
+
+# Cell type aggregates to exclude (T/NK bystanders)
+EXCLUDE_CTYPES <- c("T-cell", "NK")
+
+# Myeloid arrest-state labels (used for lineage assignment)
+MYELOID_CTYPES  <- c("cDC", "DC-progenitor", "GMP", "MEP", "Monocyte", "pDC")
+HSC_CTYPES      <- c("HSC/MPP", "LMPP")
+NK_T_CTYPES     <- c("NK", "T-cell")
+B_CTYPES        <- c("CLP", "Immature-B", "Mature-B-1", "Mature-B-2",
+                      "Pre-B", "Pre-pro-B", "Pro-B")
+
+# Arrest-state colour palettes
+BLAST_LINEAGE_COLORS <- c("B-lineage"    = "#619ccf",
+                           "HSC-like"     = "#00ba38",
+                           "Myeloid-like" = "#f8766d")
+
+ARREST_STATE_ORDER <- c("CLP", "Pre-pro-B", "Pro-B", "Pre-B", "Immature-B",
+                          "Mature-B-1", "Mature-B-2",
+                          "HSC/MPP", "LMPP",
+                          "GMP", "MEP", "Monocyte", "DC-progenitor", "pDC", "cDC")
+
+ARREST_STATE_COLORS <- c("#619ccf","#75a8d5","#89b5db","#9cc1e1","#b0cee7",
+                          "#c4daed","#d7e6f3",
+                          "#00ba38","#60d483",
+                          "#f8766d","#f9877f","#fa9892","#fba9a4","#fbbbb6","#fcccc8")
+
+# MAST DEG thresholds
+MAST_MIN_PCT    <- 0.20
+MAST_LFC_ALL    <- 0.25   # for cohort-wide myeloid vs B comparison
+MAST_LFC_SUBTYPE <- 0.5   # for subtype-specific comparisons (CD-marker filter)
+
+# Gene labels for volcano plots
+MYL_GENES_TO_LABEL <- c("FTH1", "SRGN", "PAX5", "LYN", "NAMPT", "LYST", "CD83",
+                          "CD44", "CHD2", "FOSB", "TET2", "S100A6", "SLC7A5",
+                          "NFKB1", "HDAC9", "CD63", "CD19", "MME", "EBF1",
+                          "VPREB1", "LEF1", "CD79B", "IGLL1", "BLNK", "RUNX2",
+                          "TGFB1", "EP300")
+
+MYL_STAGE_GENES_TO_LABEL <- c("ZEB2", "SLC7A5", "INPP5A", "ZNF331", "CCDC26",
+                                "PTPRC", "KLF6", "CXCR4", "MEIS1", "JUNB",
+                                "CD44", "VIM", "ZEB1", "NR3C1", "ENO1", "GNG7",
+                                "HK2", "LDHA", "BRD4", "SLC38A1", "GSN", "PRMT9",
+                                "ZFP36L2")
+
+# TF volcano thresholds
+TF_LFC_CUTOFF <- 0.5
+TF_PADJ_CUTOFF <- 0.05
+
+# Figure 3 TRN heatmap TF subset (key myeloid-associated TFs)
+MYL_TRN_TFS <- c("BCL11A", "SPI1", "JUNB", "FOSL2", "JUN", "JUND",
+                   "BACH1", "FOS", "MECP2", "SP3", "KLF4", "SP1",
+                   "SP4", "CEBPA", "CEBPB")
+```
+
+---
+
+# Helper functions
+
+```{r helpers}
+# assign_blast_lineage ---------------------------------------------------
+# Adds Blast_Lineage and (optionally) Blast_Lineage_Subsets columns to a
+# metadata data frame using the lineage maps defined in USER CONFIGURATION.
+assign_blast_lineage <- function(meta_df, add_subsets = TRUE) {
+  meta_df <- meta_df %>%
+    mutate(Blast_Lineage = case_when(
+      Projected.Ctype.Wmethod %in% MYELOID_CTYPES ~ "Myeloid-like",
+      Projected.Ctype.Wmethod %in% HSC_CTYPES     ~ "HSC-like",
+      Projected.Ctype.Wmethod %in% NK_T_CTYPES    ~ "NK_T-cell",
+      Projected.Ctype.Wmethod %in% B_CTYPES       ~ "B-lineage"
+    ))
+  if (add_subsets) {
+    meta_df <- meta_df %>%
+      mutate(Blast_Lineage_Subsets = case_when(
+        Projected.Ctype.Wmethod %in% MYELOID_CTYPES ~ Projected.Ctype.Wmethod,
+        .default = Blast_Lineage
+      ))
+  }
+  meta_df
+}
+
+# remove_unpaired -------------------------------------------------------
+# Removes patients with only one timepoint for a given grouping variable,
+# which would break paired statistical tests.
+remove_unpaired <- function(df, group_var, pt_var = "PT.number") {
+  df %>%
+    group_by(.data[[group_var]], .data[[pt_var]]) %>%
+    filter(n() != 1) %>%
+    arrange(.data[[group_var]], .data[[pt_var]]) %>%
+    ungroup()
+}
+
+# find_common_markers ---------------------------------------------------
+# For each element of deg_list, filters DEGs by the supplied thresholds,
+# then finds genes shared across all subtypes and across the three most
+# common subtypes. When cd_markers is supplied, an additional filter
+# restricts to CD-antigen genes only.
+#
+# Returns a named list with elements:
+#   myeloid_all    : myeloid-enriched genes across all subtypes
+#   myeloid_3      : myeloid-enriched genes in 3 of 4 subtypes
+#   b_all          : B-lineage-enriched genes across all subtypes
+#   b_3            : B-lineage-enriched genes in 3 of 4 subtypes
+find_common_markers <- function(deg_list,
+                                padj_cutoff = 0.01,
+                                lfc_cutoff  = 0.5,
+                                cd_markers  = NULL) {
+  filter_genes <- function(df, direction, cd_syms = NULL) {
+    df <- df %>%
+      filter(p_val_adj < padj_cutoff,
+             if (direction == "myeloid") avg_log2FC >  lfc_cutoff
+             else                        avg_log2FC < -lfc_cutoff,
+             blast.traj == if (direction == "myeloid") "Myeloid" else "B-cell")
+    if (!is.null(cd_syms)) df <- df %>% filter(gene %in% cd_syms)
+    df$gene
+  }
+
+  cd_syms <- if (!is.null(cd_markers)) cd_markers$Approved.symbol else NULL
+
+  myl_lists <- lapply(deg_list, filter_genes, direction = "myeloid",
+                       cd_syms = cd_syms)
+  b_lists   <- lapply(deg_list, filter_genes, direction = "b",
+                       cd_syms = cd_syms)
+
+  list(
+    myeloid_all = Reduce(base::intersect, myl_lists),
+    myeloid_3   = Reduce(base::intersect, myl_lists[1:3]),
+    b_all       = Reduce(base::intersect, b_lists),
+    b_3         = Reduce(base::intersect, b_lists[1:3])
+  )
+}
+
+# make_volcano ----------------------------------------------------------
+# Wrapper for EnhancedVolcano with consistent styling across all panels.
+make_volcano <- function(df, gene_col = "gene", lfc_col = "avg_log2FC",
+                          padj_col = "p_val_adj",
+                          fc_cutoff = MAST_LFC_ALL, p_cutoff = 0.05,
+                          title = "", select_labs = NULL,
+                          col_custom = NULL, xlim = c(-2.2, 2.2)) {
+  EnhancedVolcano(df %>% dplyr::select(all_of(c(gene_col, lfc_col, padj_col))),
+                  lab           = df[[gene_col]],
+                  x             = lfc_col, y = padj_col,
+                  drawConnectors  = TRUE,
+                  min.segment.length = 0.5,
+                  FCcutoff        = fc_cutoff,
+                  pCutoff         = p_cutoff,
+                  xlim            = xlim,
+                  title           = title,
+                  selectLab       = select_labs,
+                  colCustom       = col_custom,
+                  labSize         = 3)
+}
+```
+
+---
+
+# STAGE 1: Load data and compute blast lineage frequencies
+
+```{r load-data}
+global.rna <- readRDS(path.global.rna)
+
+meta <- read.csv(path.projection.meta, row.names = 1) %>%
+  assign_blast_lineage()
+
+global.rna <- AddMetaData(global.rna, metadata = meta)
+Idents(global.rna) <- "Ctype.Aggregate"
+global.rna <- subset(global.rna, idents = EXCLUDE_CTYPES, invert = TRUE)
+global.rna <- RunUMAP(global.rna, dims = 1:40, reduction = "pca")
+
+# Per-cell metadata for frequency analysis
+global.meta <- global.rna@meta.data %>%
+  mutate(PT.number = factor(PT.number),
+         Stage     = factor(Stage, levels = c("IDX", "MRD")))
+
+# Blast lineage frequency per patient × stage (broad: B/HSC/Myeloid)
+blast.freq <- global.meta %>%
+  group_by(Subtype, PT.number, Stage, Blast_Lineage) %>%
+  summarize(n = n(), .groups = "drop") %>%
+  group_by(Subtype, PT.number, Stage) %>%
+  mutate(freq  = n / sum(n),
+         label = paste0(Stage, "_", PT.number)) %>%
+  filter(PT.number %notin% EXCLUDE_PATIENTS) %>%
+  arrange(PT.number, Stage)
+blast.freq$label <- factor(blast.freq$label, levels = unique(blast.freq$label))
+
+# Fine-grained frequency per patient × stage × arrest-state
+blast.freq.dt <- global.meta %>%
+  group_by(Subtype, PT.number, Stage, Projected.Ctype.Wmethod) %>%
+  summarize(n = n(), .groups = "drop") %>%
+  group_by(Subtype, PT.number, Stage) %>%
+  mutate(freq  = n / sum(n),
+         label = paste0(Stage, "_", PT.number)) %>%
+  filter(PT.number %notin% EXCLUDE_PATIENTS) %>%
+  arrange(PT.number, Stage)
+blast.freq.dt$label <- factor(blast.freq.dt$label,
+                               levels = unique(blast.freq.dt$label))
+blast.freq.dt$Projected.Ctype.Wmethod <- factor(
+  blast.freq.dt$Projected.Ctype.Wmethod, levels = ARREST_STATE_ORDER
+)
+```
+
+## Stage 1 plots
+
+```{r overview-plots, fig.width=10, fig.height=6}
+myl.blasts <- subset(global.rna, idents = c("Mature-Myeloid", "Myeloid-Progenitor"))
+
+# Per-subtype composition bar charts
+p1  <- myl.blasts@meta.data %>%
+  ggplot(aes(Subtype)) + geom_bar(aes(fill = Stage)) + ggtitle("Stage")
+
+p2  <- myl.blasts@meta.data %>%
+  ggplot(aes(Subtype)) + geom_bar(aes(fill = PT.number)) +
+  ggtitle("Patient Number") + guides(fill = "none")
+
+p3  <- myl.blasts@meta.data %>%
+  ggplot(aes(Subtype)) + geom_bar(aes(fill = Projected.Ctype.Wmethod)) +
+  ggtitle("Arrest State") +
+  theme(legend.text = element_text(size = 8),
+        legend.key.size = unit(0.25, "cm")) +
+  scale_fill_manual(values = ARREST_STATE_COLORS) +
+  guides(fill = guide_legend(title.position = "top", title.hjust = 0.5))
+
+p4  <- myl.blasts@meta.data %>%
+  ggplot(aes(Stage)) + geom_bar(aes(fill = Projected.Ctype.Wmethod),
+                                  position = "fill", linewidth = 0.15,
+                                  color = "black") +
+  ggtitle("Arrest State by Stage") +
+  theme(legend.text = element_text(size = 8),
+        legend.key.size = unit(0.25, "cm")) +
+  scale_fill_manual(values = ARREST_STATE_COLORS) +
+  facet_wrap(~ Subtype, ncol = 4)
+
+# Arrest-state frequency per patient pair (nested facet)
+p11 <- blast.freq.dt %>%
+  filter(PT.number %notin% "PT5") %>%
+  ggplot(aes(x = Stage, y = freq)) +
+  geom_col(aes(fill = Projected.Ctype.Wmethod), position = "fill",
+            linewidth = 0.05, color = "black") +
+  facet_wrap(~ Subtype + PT.number, scales = "free_x", nrow = 4) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1, size = 7)) +
+  scale_fill_manual(values = ARREST_STATE_COLORS)
+
+p12 <- blast.freq.dt %>%
+  filter(PT.number %notin% "PT5") %>%
+  ggplot(aes(x = Stage, y = freq)) +
+  geom_col(aes(fill = Projected.Ctype.Wmethod), position = "fill",
+            linewidth = 0.05, color = "black") +
+  ggh4x::facet_nested(~ Subtype + PT.number, scales = "free_x", bleed = TRUE) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1, size = 7)) +
+  scale_fill_manual(values = ARREST_STATE_COLORS)
+
+pdf(file.path(dir.plots, "Myeloid_Blasts_Overview.pdf"), height = 6, width = 10)
+ggarrange(p1, p2, p3, nrow = 1, ncol = 3, common.legend = FALSE, legend = "bottom")
+ggarrange(p4, nrow = 1, common.legend = FALSE, legend = "bottom")
+dev.off()
+
+ggsave(p11, filename = file.path(dir.plots, "Proj.Ctype.byPatientPair.eps"),
+       device = "eps", width = 8, height = 10)
+ggsave(p12, filename = file.path(dir.plots, "Proj.Ctype.byPatientPair_nested.eps"),
+       device = "eps", width = 20, height = 4)
+```
+
+---
+
+# STAGE 2: Myeloid compartment changes (IDX → MRD)
+
+```{r myeloid-changes}
+# Build per-cell metadata with lineage assignments and dASP cluster
+metadata_to_add <- read.csv(path.blast.meta, row.names = 1) %>%
+  assign_blast_lineage() %>%
+  filter(Level1.anno == "Blast", Stage != "RLP",
+         PT.number %notin% EXCLUDE_PATIENTS)
+
+dasp.clusters <- read.csv(path.dasp.clusters, row.names = "X") %>%
+  dplyr::select(Row.names, k_4_Myeloid) %>%
+  rename(PT.number = Row.names, k_cluster = k_4_Myeloid)
+
+metadata_to_add <- metadata_to_add %>%
+  left_join(dasp.clusters, by = "PT.number")
+
+# Cell-type frequency by lineage (broad)
+Ctype_count_byStage_Lineage <- metadata_to_add %>%
+  filter(!Projected.Ctype.Wmethod %in% EXCLUDE_CTYPES,
+         Stage %in% c("IDX", "MRD")) %>%
+  group_by(Patient.Sample, Stage) %>%
+  mutate(n = n()) %>%
+  group_by(Patient.Sample, Stage, Blast_Lineage) %>%
+  mutate(cell_n = n()) %>%
+  ungroup() %>%
+  mutate(freq = cell_n / n) %>%
+  dplyr::select(-patient_bc) %>%
+  distinct()
+
+Ctype_count_byStage_Lineage$Stage <- factor(
+  Ctype_count_byStage_Lineage$Stage, levels = c("IDX", "MRD"))
+
+# Paired plot: myeloid lineage fraction by subtype
+myl.lineage <- Ctype_count_byStage_Lineage %>%
+  filter(Blast_Lineage == "Myeloid-like") %>%
+  dplyr::select(Blast_Lineage, PT.number, freq, Stage, Subtype) %>%
+  distinct() %>%
+  remove_unpaired("Blast_Lineage")
+
+pdf(file.path(dir.plots, "MyeloidLineageFraction_IDXvsMRD_bySubtype.pdf"),
+    height = 6, width = 6)
+
+ggpaired(myl.lineage, x = "Stage", y = "freq", color = "Stage",
+         facet.by = "Subtype", point.size = 0.5, id = "PT.number",
+         line.color = "gray", line.size = 0.25, scales = "free_y",
+         ncol = 5, width = 0.5) +
+  stat_compare_means(paired = TRUE, na.rm = TRUE, label = "p.signif",
+                     hide.ns = TRUE, label.x.npc = "center")
+
+dev.off()
+
+# Myeloid-HSC frequency correlation scatter (IDX and MRD separately)
+BlastLineage_freq_wide <- Ctype_count_byStage_Lineage %>%
+  dplyr::select(PT.number, Blast_Lineage, freq, Stage, MRD.Group) %>%
+  distinct() %>%
+  pivot_wider(names_from = Blast_Lineage, values_from = freq)
+
+pdf(file.path(dir.plots, "MyeloidFrequency_Correlation.pdf"),
+    height = 5, width = 7)
+
+for (stage0 in c("IDX", "MRD")) {
+  print(
+    BlastLineage_freq_wide %>%
+      filter(Stage == stage0) %>%
+      ggplot(aes(x = `Myeloid-like`, y = `HSC-like`)) +
+      geom_point() +
+      labs(title = paste("Myeloid vs HSC-like frequency:", stage0))
+  )
+}
+
+# Myeloid frequency by MRD group at each stage
+for (stage0 in c("IDX", "MRD")) {
+  p <- Ctype_count_byStage_Lineage %>%
+    filter(Blast_Lineage == "Myeloid-like", Stage == stage0) %>%
+    dplyr::select(PT.number, freq, MRD.Group) %>%
+    distinct() %>%
+    ggboxplot(x = "MRD.Group", y = "freq",
+               title = paste("Myeloid Cell Frequency by MRD Group at", stage0))
+  print(p)
+}
+
+dev.off()
+```
+
+---
+
+# STAGE 3: Differential gene expression — myeloid-like vs B-lineage
+
+## 3.1 Cohort-wide DEGs
+
+```{r myeloid-vs-b-deg}
+Idents(global.rna) <- "Ctype.Aggregate"
+myeloid.cells <- WhichCells(global.rna,
+                              idents = c("Mature-Myeloid", "Myeloid-Progenitor"))
+b.cells       <- WhichCells(global.rna,
+                              idents = c("CLP", "Immature-Mature-B",
+                                         "Pre-pro-B", "Pro-B-Pre-B"))
+
+myl.vs.b.deg <- FindMarkers(global.rna,
+                              ident.1             = myeloid.cells,
+                              ident.2             = b.cells,
+                              test.use            = "MAST",
+                              min.pct             = MAST_MIN_PCT,
+                              max.cells.per.ident = 10000,
+                              latent.vars         = "PT.number") %>%
+  rownames_to_column("gene") %>%
+  mutate(blast.traj = if_else(avg_log2FC > 0, "Myeloid", "B-cell"))
+
+# Volcano colour map: myeloid-enriched = red, B-lineage = blue, NS = gray
+keyvals.myl.b <- ifelse(
+  myl.vs.b.deg$p_val_adj < 0.05 & myl.vs.b.deg$avg_log2FC >  MAST_LFC_ALL, "red",
+  ifelse(myl.vs.b.deg$p_val_adj < 0.05 & myl.vs.b.deg$avg_log2FC < -MAST_LFC_ALL,
+         "royalblue", "gray"))
+names(keyvals.myl.b)[keyvals.myl.b == "red"]      <- "Myeloid-like"
+names(keyvals.myl.b)[keyvals.myl.b == "gray"]     <- "NS"
+names(keyvals.myl.b)[keyvals.myl.b == "royalblue"] <- "B-lineage"
+
+all.blasts.volcano <- make_volcano(myl.vs.b.deg,
+                                    fc_cutoff    = MAST_LFC_ALL,
+                                    title        = "All Myeloid-Like Blasts vs. B-lineage",
+                                    select_labs  = MYL_GENES_TO_LABEL,
+                                    col_custom   = keyvals.myl.b)
+
+write.csv(myl.vs.b.deg,
+          file.path(dir.tables, "MyeloidvsBLineageBlasts_DEG.csv"),
+          row.names = FALSE)
+```
+
+## 3.2 Subtype-specific DEGs
+
+```{r subtype-degs, eval=FALSE}
+# Set RERUN_SUBTYPE_DEGS = TRUE in config to re-run FindMarkers from scratch.
+# Otherwise, load the pre-saved RDS.
+if (RERUN_SUBTYPE_DEGS) {
+  subtype.blasts   <- SplitObject(global.rna, split.by = "Subtype")
+  subtype.deg.list <- lapply(names(subtype.blasts), function(st) {
+    obj         <- subtype.blasts[[st]]
+    myl.cells   <- WhichCells(obj, idents = c("Mature-Myeloid", "Myeloid-Progenitor"))
+    b.cells.sub <- WhichCells(obj, idents = c("CLP", "Immature-Mature-B",
+                                                "Pre-pro-B", "Pro-B-Pre-B"))
+    markers <- FindMarkers(obj,
+                            ident.1             = myl.cells,
+                            ident.2             = b.cells.sub,
+                            logfc.threshold     = MAST_LFC_SUBTYPE,
+                            test.use            = "MAST",
+                            min.pct             = MAST_MIN_PCT,
+                            max.cells.per.ident = min(length(myl.cells),
+                                                       length(b.cells.sub)),
+                            latent.vars         = c("PT.number", "Stage"))
+    markers %>%
+      rownames_to_column("gene") %>%
+      filter(!grepl("^MT-", gene), p_val_adj < 0.05) %>%
+      mutate(blast.traj = if_else(avg_log2FC > 0, "Myeloid", "B-cell"))
+  })
+  names(subtype.deg.list) <- names(subtype.blasts)
+  saveRDS(subtype.deg.list, path.subtype.degs)
+} else {
+  subtype.deg.list <- readRDS(path.subtype.degs)
+}
+```
+
+## 3.3 Common and CD-marker genes across subtypes
+
+`find_common_markers()` applies identical logic to both the unrestricted DEG
+set and the CD-antigen subset; the `cd_markers` argument switches between them.
+
+```{r common-markers}
+# All DEGs shared across subtypes
+common.all <- find_common_markers(
+  subtype.deg.list,
+  padj_cutoff = 0.01,
+  lfc_cutoff  = MAST_LFC_SUBTYPE
+)
+
+cat("Myeloid genes shared across all subtypes:", length(common.all$myeloid_all), "\n")
+print(noquote(common.all$myeloid_all))
+cat("B-lineage genes shared across all subtypes:", length(common.all$b_all), "\n")
+print(noquote(common.all$b_all))
+
+# CD-antigen subset
+cd.markers <- read.csv(path.cd.markers)
+common.cd <- find_common_markers(
+  subtype.deg.list,
+  padj_cutoff = 0.01,
+  lfc_cutoff  = MAST_LFC_SUBTYPE,
+  cd_markers  = cd.markers
+)
+
+cat("Myeloid CD genes shared across all subtypes:", length(common.cd$myeloid_all), "\n")
+print(common.cd$myeloid_all)
+cat("B-lineage CD genes shared across all subtypes:", length(common.cd$b_all), "\n")
+print(common.cd$b_all)
+```
+
+## 3.4 Volcano re-plots (from pre-computed objects)
+
+```{r volcano-replots}
+load(path.myl.deg.rdata)
+# Expected objects: myl.vs.b.deg, myl.vs.b.mrd.deg, myl.vs.b.idx.deg,
+#                   mrd.vs.idx.myl.deg, mrd.vs.idx.b.deg
+
+# Annotate unique vs common DEGs (unique to myeloid, not shared with B)
+b.idx   <- mrd.vs.idx.b.deg   %>% filter(blast.traj == "IDX") %>% pull(gene)
+b.mrd   <- mrd.vs.idx.b.deg   %>% filter(blast.traj == "MRD") %>% pull(gene)
+myl.idx <- mrd.vs.idx.myl.deg %>% filter(blast.traj == "IDX") %>% pull(gene)
+myl.mrd <- mrd.vs.idx.myl.deg %>% filter(blast.traj == "MRD") %>% pull(gene)
+
+mrd.vs.idx.myl.deg <- mrd.vs.idx.myl.deg %>%
+  mutate(unique = case_when(
+    blast.traj == "IDX" & gene %notin% b.idx ~ "unique",
+    blast.traj == "MRD" & gene %notin% b.mrd ~ "unique",
+    .default = "common"
+  ))
+
+# Colour map: unique DEGs = green, common DEGs = blue
+keyvals.unique <- ifelse(mrd.vs.idx.myl.deg$unique == "unique",
+                          "forestgreen", "royalblue")
+keyvals.unique[is.na(keyvals.unique)] <- "black"
+names(keyvals.unique)[keyvals.unique == "forestgreen"] <- "Unique DEG"
+names(keyvals.unique)[keyvals.unique == "royalblue"]   <- "Common DEG"
+names(keyvals.unique)[keyvals.unique == "black"]       <- "DEG"
+
+p1 <- make_volcano(myl.vs.b.deg,
+                    fc_cutoff   = MAST_LFC_ALL,
+                    title       = "Myeloid-Like Blasts vs. B-lineage",
+                    select_labs = MYL_GENES_TO_LABEL,
+                    col_custom  = keyvals.myl.b)
+
+p4 <- make_volcano(mrd.vs.idx.myl.deg,
+                    fc_cutoff   = MAST_LFC_SUBTYPE,
+                    title       = "Myeloid-Like Blasts MRD vs. IDX",
+                    select_labs = MYL_STAGE_GENES_TO_LABEL,
+                    col_custom  = keyvals.unique)
+
+pdf(file.path(dir.plots, "Myl_VolcanoPlot.pdf"), width = 5, height = 8)
+p1
+dev.off()
+
+pdf(file.path(dir.plots, "Myl_IDXvsMRD_VolcanoPlot.pdf"), width = 6, height = 6)
+p4
+dev.off()
+```
+
+---
+
+# STAGE 4: Differential TF activity (chromVAR)
+
+```{r dtf-setup}
+chromVAR.ds  <- readRDS(path.chromvar)
+seurat.atac.ds <- readRDS(path.atac.seurat)
+
+# Strip database prefix from chromVAR motif names to recover TF gene names
+z.score.ds <- chromVAR.ds@assays@data$z
+rownames(z.score.ds) <- sapply(rownames(z.score.ds),
+                                function(x) strsplit(x, "_")[[1]][3])
+
+# Build joint ATAC + chromVAR object, filtered to blast cells IDX/MRD
+seurat.atac.ds.sub <- subset(seurat.atac.ds, cells = colnames(chromVAR.ds))
+seurat.atac.ds.sub[["chromvar"]] <- CreateAssayObject(z.score.ds)
+
+# Attach blast metadata
+meta.ds <- metadata_to_add %>%
+  filter(patient_bc %in% colnames(chromVAR.ds)) %>%
+  assign_blast_lineage() %>%
+  as.data.frame()
+rownames(meta.ds) <- meta.ds$patient_bc
+
+Idents(seurat.atac.ds.sub) <- "Level1.anno"
+seurat.atac.ds.sub <- subset(seurat.atac.ds.sub, idents = "Blast")
+seurat.atac.ds.sub <- AddMetaData(seurat.atac.ds.sub, meta.ds) %>%
+  subset(subset = Blast_Lineage != "NK_T-cell")
+
+Idents(seurat.atac.ds.sub) <- "Stage"
+seurat.atac.ds.sub <- subset(seurat.atac.ds.sub, idents = c("IDX", "MRD"))
+
+# Stratified object list: all blasts, IDX only, MRD only
+Idents(seurat.atac.ds.sub) <- "Blast_Lineage"
+seurat.obj.list <- list(
+  All_Blasts     = seurat.atac.ds.sub,
+  All_IDX_Blasts = subset(seurat.atac.ds.sub,
+                            subset = Stage == "IDX"),
+  All_MRD_Blasts = subset(seurat.atac.ds.sub,
+                            subset = Stage == "MRD")
+)
+```
+
+```{r dtf-findmarkers}
+# Run DTF analysis for each stratum and save results
+for (stratum in names(seurat.obj.list)) {
+  obj <- seurat.obj.list[[stratum]]
+  Idents(obj) <- "Blast_Lineage"
+  min.cells <- min(table(obj$Blast_Lineage,
+                          obj$Stage)[c("B-lineage", "Myeloid-like"), ])
+
+  dtf <- FindMarkers(obj,
+                      ident.1             = "Myeloid-like",
+                      ident.2             = "B-lineage",
+                      test.use            = "LR",
+                      latent.vars         = "PTnumber",
+                      max.cells.per.ident = min.cells,
+                      assay               = "chromvar")
+  dtf <- data.table(dtf, keep.rownames = TRUE)
+
+  # Expression filter: TF gene must be expressed in >= 10% of cells
+  # in the relevant lineage (reduces motif-only false positives)
+  meta.sub  <- meta.ds[meta.ds$patient_bc %in% rownames(obj@meta.data), ]
+  rna.myl   <- global.rna@assays$RNA@counts[,
+    meta.sub[meta.sub$Blast_Lineage == "Myeloid-like", ]$patient_bc]
+  rna.b     <- global.rna@assays$RNA@counts[,
+    meta.sub[meta.sub$Blast_Lineage == "B-lineage",    ]$patient_bc]
+
+  expr.myl  <- names(which(Matrix::rowSums(rna.myl > 0) >= 0.1 * ncol(rna.myl)))
+  expr.b    <- names(which(Matrix::rowSums(rna.b   > 0) >= 0.1 * ncol(rna.b)))
+
+  filtered.tfs <- unique(c(
+    dtf[rn %in% expr.myl & avg_log2FC > 0, rn],
+    dtf[rn %in% expr.b   & avg_log2FC < 0, rn]
+  ))
+
+  write.table(dtf[rn %in% filtered.tfs],
+              quote = FALSE, sep = "\t", row.names = FALSE,
+              file = file.path(dir.tables,
+                                paste0(stratum,
+                                       "_EnrichedTFs_MyeloidVsB_filteredbyexpression.txt")))
+  cat(stratum, "DTFs saved:", nrow(dtf[rn %in% filtered.tfs]), "\n")
+}
+```
+
+```{r dtf-volcano}
+all.tf <- read.delim(file.path(dir.tables,
+                                "All_Blasts_EnrichedTFs_MyeloidVsB_filteredbyexpression.txt"))
+idx.tf <- read.delim(file.path(dir.tables,
+                                "All_IDX_Blasts_EnrichedTFs_MyeloidVsB_filteredbyexpression.txt"))
+mrd.tf <- read.delim(file.path(dir.tables,
+                                "All_MRD_Blasts_EnrichedTFs_MyeloidVsB_filteredbyexpression.txt"))
+
+make_tf_keyvals <- function(df, lfc_cutoff, padj_cutoff) {
+  kv <- ifelse(df$p_val_adj < padj_cutoff & df$avg_log2FC >  lfc_cutoff, "red",
+         ifelse(df$p_val_adj < padj_cutoff & df$avg_log2FC < -lfc_cutoff,
+                "royalblue", "gray"))
+  names(kv)[kv == "red"]       <- "Myeloid-like"
+  names(kv)[kv == "gray"]      <- "NS"
+  names(kv)[kv == "royalblue"] <- "B-lineage"
+  kv
+}
+
+pdf(file.path(dir.plots, "AllBlasts_TFActivity.pdf"), height = 8, width = 6)
+make_volcano(all.tf %>% rename(gene = rn),
+              fc_cutoff  = TF_LFC_CUTOFF,
+              col_custom = make_tf_keyvals(all.tf, TF_LFC_CUTOFF, TF_PADJ_CUTOFF),
+              title      = "All TF Activity: B-lineage vs. Myeloid-like Blasts")
+make_volcano(idx.tf %>% rename(gene = rn),
+              fc_cutoff = TF_LFC_CUTOFF,
+              title     = "IDX TF Activity: B-lineage vs. Myeloid-like Blasts")
+make_volcano(mrd.tf %>% rename(gene = rn),
+              fc_cutoff = TF_LFC_CUTOFF,
+              title     = "MRD TF Activity: B-lineage vs. Myeloid-like Blasts")
+dev.off()
+```
+
+---
+
+# STAGE 5: Figure 3 manuscript panels
+
+All enrichment tables below are sourced from Metascape pathway analysis
+run on DEG lists from Stage 3 and TRN regulon gene lists from Stage 4.
+
+## 5.1 GO diverging bar chart (myeloid vs B-lineage)
+
+```{r fig3-go-bar}
+# GO enrichment sourced from Metascape output; columns: GO, Description,
+# B-lineage (-log10 p), Myeloid-like (-log10 p)
+my.go <- read.csv(path.myl.go.csv)
+colnames(my.go) <- c("GO", "Description", "B-lineage", "Myeloid-like")
+
+my.go.long <- my.go %>%
+  pivot_longer(cols = c("B-lineage", "Myeloid-like"),
+               names_to  = "Lineage",
+               values_to = "Enrichment_Score") %>%
+  # Mirror B-lineage scores to the left for the diverging layout
+  mutate(EnrichmentScore = if_else(Lineage == "B-lineage",
+                                    Enrichment_Score, -Enrichment_Score))
+
+p.go.bar <- ggplot(my.go.long,
+                    aes(x = reorder(Description, -EnrichmentScore),
+                        y = EnrichmentScore, fill = Lineage)) +
+  geom_bar(stat = "identity", position = "identity") +
+  coord_flip() +
+  labs(x = NULL, y = "-log10(p.adj) (mirrored)",
+       title = "GO Enrichment: Myeloid-like vs B-lineage (Metascape)") +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+pdf(file.path(dir.fig3, "MyeloidVsB_GO_divergingBar.pdf"), height = 4, width = 8)
+p.go.bar
+dev.off()
+```
+
+## 5.2 TRN pathway heatmaps (Metascape)
+
+```{r fig3-trn-heatmaps}
+# Helper: load Metascape heatmap CSV and strip column prefix
+load_metascape_heatmap <- function(path) {
+  df           <- read.csv(path)
+  new_cols     <- sub("X_LogP_Transcription.Factor.", "", colnames(df[, 3:ncol(df)]))
+  colnames(df) <- c(colnames(df[, 1:2]), new_cols)
+  df
+}
+
+my.trn.go <- load_metascape_heatmap(path.myl.trn.csv)
+b.trn.go  <- load_metascape_heatmap(path.b.trn.csv)
+
+# Subset myeloid TRN heatmap to key TFs defined in config
+my.trn.subset <- my.trn.go[, c("GO", "Description", MYL_TRN_TFS)]
+
+pdf(file.path(dir.fig3, "Myeloid_TRN_pathway_heatmap.pdf"), height = 4, width = 6)
+ComplexHeatmap::pheatmap(
+  -my.trn.subset[, MYL_TRN_TFS],
+  cluster_rows  = TRUE, cluster_cols  = TRUE,
+  labels_row    = my.trn.subset$Description,
+  treeheight_row = 0, treeheight_col = 0,
+  color         = colorRampPalette(c("#ffffff", "#d73027"))(501),
+  breaks        = seq(0, 10, by = 0.02),
+  legend_breaks = c(0, 5, 10),
+  column_title  = "Myeloid TRN — Metascape"
+)
+dev.off()
+
+pdf(file.path(dir.fig3, "BLineage_TRN_pathway_heatmap.pdf"), height = 4, width = 6)
+ComplexHeatmap::pheatmap(
+  -b.trn.go[, 3:ncol(b.trn.go)],
+  cluster_rows  = TRUE, cluster_cols  = TRUE,
+  labels_row    = b.trn.go$Description,
+  treeheight_row = 0, treeheight_col = 0,
+  color         = colorRampPalette(c("#ffffff", "#d73027"))(501),
+  breaks        = seq(0, 10, by = 0.02),
+  legend_breaks = c(0, 5, 10),
+  column_title  = "B-lineage TRN — Metascape"
+)
+dev.off()
+```
+
+## 5.3 TC IDX GO enrichment tile plot (Metascape)
+
+```{r fig3-tc-go-tile}
+tc.go <- read.csv(path.tc.idx.go.csv) %>%
+  pivot_longer(cols = starts_with("X_LogP_"),
+               names_to  = "TC",
+               values_to = "LogP") %>%
+  mutate(TC   = str_replace(TC, "X_LogP_", ""),
+         LogP = abs(LogP))
+
+tc.go$Description <- factor(tc.go$Description,
+                              levels = rev(unique(read.csv(path.tc.idx.go.csv)$Description)))
+
+p.tc.tile <- ggplot(tc.go, aes(x = TC, y = Description, fill = LogP)) +
+  geom_tile(color = "gray", linewidth = 0.3) +
+  scale_fill_gradient(low = "white", high = "red",
+                       limits = c(0, max(tc.go$LogP)),
+                       name   = "-Log(P-value)") +
+  scale_x_discrete(labels = c("Bidirectional", "HSPC/\nMyeloid",
+                                "Immature/\nMature-B", "Mature-B")) +
+  labs(title = "TC IDX Signature GO Enrichment (Metascape)") +
+  theme_minimal(base_size = 11) +
+  theme(axis.text.x  = element_text(angle = 45, vjust = 1, hjust = 1),
+        axis.title   = element_blank(),
+        panel.grid   = element_blank())
+
+ggsave(file.path(dir.fig3, "TC_IDX_GO_heatmap.pdf"),
+       p.tc.tile, width = 7, height = 5)
+```
+
+---
+
+```{r session-info}
+sessionInfo()
+```

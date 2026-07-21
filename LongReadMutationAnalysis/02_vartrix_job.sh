@@ -1,35 +1,34 @@
 #!/bin/bash
 # =============================================================================
-# Vartrix Variant Genotyping — Per-Barcode Long-Read BAM
+# Vartrix Variant Genotyping — Dual Hybrid 
 # =============================================================================
 #
 # Description:
-#   For each demultiplexed PacBio barcode, extracts cell barcodes from the
-#   annotated intersection BAM produced by iso-seq.sh, then runs vartrix to
-#   generate a per-cell variant genotype matrix across the MRD mutation panel.
+#   For each sample processed by 01_iso-seq.sh, extracts cell barcodes from
+#   the mapped BAM and runs vartrix in two modes:
 #
-#   Steps (per barcode):
-#     1. Extract all unique cell barcodes (CB tag) from the annotated BAM
-#     2. Index the annotated BAM
-#     3. Run vartrix to produce a sparse consensus genotype matrix
-#        (rows = variants, cols = cell barcodes; values: 0=no call,
-#         1=ref/ref, 2=alt/alt, 3=alt/ref)
+#     1. Coverage mode — produces separate ALT and REF read-count matrices,
+#        enabling downstream coverage-weighted pseudobulk VAF computation
+#     2. Consensus mode — produces a per-cell genotype call matrix
+#        (0 = no call, 1 = ref/ref, 2 = alt/alt, 3 = alt/ref)
+#
+#   Both matrices share the same barcode and variant ordering so they can
+#   be loaded and compared directly in the downstream R analysis script.
 #
 # Usage:
-#   sbatch vartrix_job.sh
-#   (or: bash vartrix_job.sh for interactive testing)
+#   sbatch 02_vartrix_job.sh
 #
-# Inputs (set in USER CONFIGURATION):
-#   - Per-barcode annotated intersection BAMs
-#     (<barcode>/<barcode>.annotated.intersect.bam), produced by iso-seq.sh
+# Inputs:
+#   - Mapped BAMs from 01_iso-seq.sh (<results_root>/<sample>/<sample>.mapped.bam)
 #   - Reference genome FASTA
 #   - Variant VCF (MRD mutation panel, GRCh38)
-#   - vartrix binary path
 #
-# Outputs (written to each barcode subdirectory):
-#   - all.cell.barcodes.tsv   : unique CB-tagged cell barcodes in this sample
-#   - vartrix_consensus.mtx   : sparse genotype matrix (MatrixMarket format)
-#   - vartrix_variants.tsv    : variant list corresponding to matrix rows
+# Outputs (per sample, written to <results_root>/<sample>/vartrix_results/):
+#   - all.cell.barcodes.tsv                  : unique CB-tagged cell barcodes
+#   - vartrix_alt.mtx / vartrix_ref.mtx      : coverage-mode read count matrices
+#   - vartrix_10x_variants.tsv               : variant list (coverage mode)
+#   - vartrix_10x_consensus.mtx              : consensus genotype matrix
+#   - vartrix_10x_variants_consensus.tsv     : variant list (consensus mode)
 #
 # Dependencies:
 #   samtools, vartrix (v1.1.7+)
@@ -42,77 +41,101 @@
 #SBATCH --time=12:00:00
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=user@institution.edu
+#SBATCH --job-name=vartrix_pipeline
+#SBATCH --output=vartrix_pipeline_%j.out
+
+set -eo pipefail
 
 
 # ── USER CONFIGURATION ────────────────────────────────────────────────────────
 
-# Demultiplexed barcode IDs — one subdirectory per barcode is expected under
-# the working directory, each containing <barcode>.annotated.intersect.bam
-barcodes=(
-    bc2001--bc2001 bc2009--bc2009 bc2017--bc2017 bc2025--bc2025
-    bc2033--bc2033 bc2041--bc2041 bc2049--bc2049 bc2057--bc2057
-    bc2065--bc2065 bc2073--bc2073 bc2081--bc2081 bc2089--bc2089
-    bc2002--bc2002 bc2010--bc2010 bc2018--bc2018 bc2026--bc2026
-    bc2034--bc2034 bc2042--bc2042 bc2050--bc2050 bc2058--bc2058
-    bc2066--bc2066 bc2074--bc2074 bc2082--bc2082
-)
-
-# Reference genome FASTA (must match the genome used for alignment)
-ref_genome="/path/to/ref/fasta/genome.fa"
+# Reference genome FASTA (must match the genome used for alignment in 01_iso-seq.sh)
+ref_genome="/path/to/GRCh38/GCA_000001405.15_GRCh38_no_alt_analysis_set.fa"
 
 # Variant VCF — MRD mutation panel (GRCh38 coordinates)
-mrd_variants="/path/to/ref/MRD_variant_list.GRCh38.vcf"
+mrd_variants="/path/to/ref/MRD_allFilteredMuts.GRCh38.vcf"
 
 # Path to vartrix binary
 vartrix="/path/to/tools/vartrix-v1.1.7-x86_64-unknown-linux-gnu/vartrix"
 
-# Working directory — must contain one subdirectory per barcode
-work_dir="/path/to/Scripts/iso-seq_pilot"
+# Results root directory (must match out_root from 01_iso-seq.sh)
+results_root="/path/to/Scripts/dual_hybrid_batch2"
 
-# Threads for vartrix
+# Sample names — must match subdirectory names created by 01_iso-seq.sh
+SAMPLES=("PAVEPS_IDX" "PAVEPS_MRD" "PAREZH_IDX" "PAXYMC_MRD")
+
+# Number of threads
 THREADS=8
 
 
-# ── Environment setup ─────────────────────────────────────────────────────────
+# ── Conda setup ───────────────────────────────────────────────────────────────
 
-source activate pb-isoseq
-cd "${work_dir}"
+source /home/user/mambaforge/etc/profile.d/conda.sh
+conda deactivate
+conda activate pb-isoseq
 
 
 # =============================================================================
-# Main loop: genotype each barcode with vartrix
+# Per-sample vartrix genotyping
 # =============================================================================
 
-for barcode in "${barcodes[@]}"; do
-    echo "Processing: ${barcode}"
-    cd "${barcode}"
+for sample in "${SAMPLES[@]}"; do
 
-    # -- Step 1: Extract unique cell barcodes from CB tag --------------------
-    # The CB:Z: tag holds the corrected cell barcode assigned by isoseq correct.
-    # Barcodes are extracted, sorted, and deduplicated for use as the vartrix
-    # cell barcode allowlist.
-    samtools view "${barcode}.annotated.intersect.bam" \
+    bam_file="${results_root}/${sample}/${sample}.mapped.bam"
+
+    echo ""
+    echo "========================================"
+    echo "  Vartrix: ${sample}"
+    echo "  BAM:     ${bam_file}"
+    echo "========================================"
+
+    if [[ ! -f "${bam_file}" ]]; then
+        echo "WARNING: ${bam_file} not found — skipping ${sample}."
+        continue
+    fi
+
+    vartrix_dir="${results_root}/${sample}/vartrix_results"
+    mkdir -p "${vartrix_dir}"
+    cd "${vartrix_dir}"
+
+    # Extract all unique cell barcodes from the CB tag
+    echo "[${sample}] Extracting cell barcodes..."
+    samtools view "${bam_file}" \
         | awk '{for(i=12;i<=NF;i++) if($i ~ /^CB:Z:/) {print substr($i,6)}}' \
-        | sort | uniq > all.cell.barcodes.tsv
+        | sort -u > all.cell.barcodes.tsv
 
-    # -- Step 2: Index the annotated BAM ------------------------------------
-    samtools index "${barcode}.annotated.intersect.bam"
-
-    # -- Step 3: Run vartrix ------------------------------------------------
-    # Produces a sparse consensus genotype matrix (vartrix_consensus.mtx) and
-    # the corresponding variant list (vartrix_variants.tsv).
-    # Genotype encoding: 0 = no coverage, 1 = ref/ref, 2 = alt/alt, 3 = alt/ref
-    "${vartrix}" \
+    # Coverage mode: separate ALT and REF read-count matrices
+    # Used for coverage-weighted pseudobulk VAF computation downstream
+    echo "[${sample}] Running vartrix (coverage mode)..."
+    ${vartrix} \
         -v "${mrd_variants}" \
-        -b "${barcode}.annotated.intersect.bam" \
+        -b "${bam_file}" \
         -f "${ref_genome}" \
+        -s coverage \
         -c all.cell.barcodes.tsv \
-        -o vartrix_consensus.mtx \
+        -o vartrix_alt.mtx \
         --threads "${THREADS}" \
-        --out-variants vartrix_variants.tsv
+        --out-variants vartrix_10x_variants.tsv \
+        --ref-matrix vartrix_ref.mtx
 
-    cd ../
-    echo "Done: ${barcode}"
+    # Consensus mode: genotype call matrix (0/1/2/3)
+    # Used for per-cell genotype assignment and Fisher's exact tests downstream
+    echo "[${sample}] Running vartrix (consensus mode)..."
+    ${vartrix} \
+        -v "${mrd_variants}" \
+        -b "${bam_file}" \
+        -f "${ref_genome}" \
+        -s consensus \
+        -c all.cell.barcodes.tsv \
+        -o vartrix_10x_consensus.mtx \
+        --threads "${THREADS}" \
+        --out-variants vartrix_10x_variants_consensus.tsv
+
+    echo "[${sample}] Vartrix done."
+
 done
 
-echo "All barcodes complete."
+echo ""
+echo "========================================"
+echo "  All samples complete."
+echo "========================================"

@@ -3,8 +3,6 @@
 ## using all normal cell types as reference
 ## test on blast cells
 
-setwd("/mnt/isilon/tan_lab/mehtar1/MRD_RM/MRD_MalignancyEvidence")
-
 library(infercnv)
 library(Seurat)
 library(data.table)
@@ -35,7 +33,7 @@ all_ann = subset(all_ann, select = Level1.anno)
 names(all_ann) <- NULL
 
 
-genelist = read.table('/mnt/isilon/tan_lab/chenc6/Tools/InferCNV/Hg38_Gene_Position.txt', 
+genelist = read.table('/Hg38_Gene_Position.txt', 
                       sep = '\t', stringsAsFactors = F)
 
 genelist = genelist[!duplicated(genelist$V1), ]
@@ -61,7 +59,7 @@ infercnv_obj = CreateInfercnvObject(raw_counts_matrix = as.matrix(mtx),
 infercnv_obj = infercnv::run(infercnv_obj,
                              cutoff = 0.1, # cutoff=1 works well for Smart-seq2, and cutoff=0.1 works well for 10x Genomics
                              min_cells_per_gene = 5,
-                             out_dir = '/mnt/isilon/tan_lab/mehtar1/MRD_RM/MRD_MalignancyEvidence/InferCNV_Results/Global', 
+                             out_dir = '/InferCNV_Results/Global', 
                              cluster_by_groups = TRUE,
                              denoise = T,
                              output_format = 'pdf',
@@ -80,13 +78,13 @@ saveRDS(seurat.rna, file = 'Global/Global_downsampledSeuratforInferCNV.rds')
 
 ## Plotting
 
-infercnv_obj <- readRDS("/mnt/isilon/tan_lab/mehtar1/MRD_RM/MRD_MalignancyEvidence/InferCNV_Results/Global/Global_finalInferCNV.rds")
+infercnv_obj <- readRDS("/InferCNV_Results/Global/Global_finalInferCNV.rds")
 
 infercnv_obj <- sample_object(infercnv_obj, n_cells=500, on_references = F, on_observations = TRUE)
 
 plot_cnv(
   infercnv_obj,
-  out_dir = "/mnt/isilon/tan_lab/mehtar1/MRD_RM/MRD_MalignancyEvidence/InferCNV_Results/Global",
+  out_dir = "/InferCNV_Results/Global",
   title = "inferCNV",
   obs_title = "Observations (Cells)",
   ref_title = "References (Cells)",

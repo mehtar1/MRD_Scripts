@@ -1,4 +1,4 @@
-#c alculate entropy per sample
+#calculate entropy per sample
 
 
 get.entropy = function(seurat.obj, cluster_columns, join.to.seurat = F){

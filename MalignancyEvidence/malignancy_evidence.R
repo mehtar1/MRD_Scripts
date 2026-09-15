@@ -344,7 +344,7 @@ FeaturePlot(seurat.sub, features = "prediction.score.max", order = TRUE) +
 cat("Validating blast percentages against clinical counts...\n")
 
 # Normal cell type labels (everything not listed is counted as Blast)
-normal.labels <- c("Mono", "N/K", "Erythroid Progenitor", "T/NK", "B")
+normal.labels <- c("Mono", "Erythroid Progenitor", "T/NK", "B")
 
 blasts.meta <- seurat.rna@meta.data %>%
   mutate(NormalStatus = case_when(

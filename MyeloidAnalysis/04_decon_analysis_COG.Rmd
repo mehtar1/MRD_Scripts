@@ -235,7 +235,7 @@ p.ch.list <- c()
 
 subtype.list <- unique(cog.s$Primary.sample.subtype)
 
-pdf("COG_SurvivalPlots_Subtype_MalignantCtypeFractions_010726.pdf", height=5, width=10)
+pdf("COG_SurvivalPlots_Subtype_MalignantCtypeFractions.pdf", height=5, width=10)
 
 for(i in 1:length(subtype.list)){
   
@@ -357,7 +357,7 @@ dev.off()
 
 ```{r}
 
-pdf("/mnt/isilon/tan_lab/mehtar1/MRD_RM/Survival_Analysis/Plots/StJudes_COG/COG_CellTypeAssociationsWithMetadata_090425.pdf", height=6, width=10)
+pdf("COG_CellTypeAssociationsWithMetadata.pdf", height=6, width=10)
 
 p1 <- cog.s@meta.data %>%
   group_by(Primary.sample.subtype) %>%

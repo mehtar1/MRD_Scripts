@@ -55,6 +55,9 @@ get.entropy = function(seurat.obj, cluster_columns, join.to.seurat = F){
 
   
   if(join.to.seurat == T){
+    avg_entropy_col <- rowMeans(entropy.individual, na.rm = TRUE)
+    seurat.obj <- AddMetaData(seurat.obj, metadata = avg_entropy_col,
+                             col.name = "average_entropy")
     return(seurat.obj)
   }else{
 

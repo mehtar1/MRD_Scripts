@@ -114,8 +114,8 @@ IDX_PADJ_CUTOFF <- 0.05   # max p_val_adj
 IDX_PCT_CUTOFF  <- 0.20   # min pct.1
 
 # ── Survival analysis parameters ─────────────────────────────────────────────
-UPPER_QUARTILE  <- 0.5    # top fraction for "high" signature group
-LOWER_QUARTILE  <- 0.5    # bottom fraction for "low" signature group
+UPPER_THRESHOLD  <- 0.5    # top fraction for "high" signature group
+LOWER_THRESHOLD  <- 0.5    # bottom fraction for "low" signature group
 
 # Risk group assignment: favorable vs. intermediate/unfavorable subtypes
 FAVORABLE_SUBTYPES <- c("ETV6-RUNX1", "Hyperdiploid", "DUX4",
@@ -152,8 +152,8 @@ gsva_score <- function(seurat.obj, gene.sets) {
 #' Kaplan–Meier + Cox EFS plot for a single signature score.
 #' Returns the Cox model coefficient table (invisibly).
 km_efs_plot <- function(seurat.obj, score.name,
-                          upper.quartile = UPPER_QUARTILE,
-                          lower.quartile = LOWER_QUARTILE,
+                          upper.threshold = UPPER_THRESHOLD,
+                          lower.threshold = LOWER_THRESHOLD,
                           risk = FALSE, mrd = FALSE, scale = TRUE) {
   surv.data <- seurat.obj@meta.data
   surv.data$rank <- rank(surv.data[[score.name]])
@@ -161,8 +161,8 @@ km_efs_plot <- function(seurat.obj, score.name,
 
   surv.data <- surv.data %>%
     mutate(high.mpp = case_when(
-      rank > n * upper.quartile ~ "Sig High",
-      rank < n * lower.quartile ~ "Sig Low"
+      rank > n * upper.threshold ~ "Sig High",
+      rank < n * lower.threshold ~ "Sig Low"
     )) %>%
     filter(!is.na(high.mpp))
 
